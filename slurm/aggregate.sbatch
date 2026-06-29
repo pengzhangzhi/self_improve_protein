@@ -25,8 +25,12 @@ embedding_root="${SI_EMBEDDING_ROOT:-${SI_DATA_ROOT}/embeddings/v0}"
 mode="${SI_MODE:-development}"
 output="${SI_AGGREGATE_OUTPUT:-${results_root}/${mode}/aggregate.json}"
 seed_args=()
+r5_gate_args=()
 if [[ "$mode" == "development" ]]; then
     seed_args=(--seed 0 --seed 1)
+else
+    : "${SI_R5_GATE:?confirmatory aggregation requires SI_R5_GATE}"
+    r5_gate_args=(--r5-gate "$SI_R5_GATE")
 fi
 
 cd "$SI_REPO_ROOT"
@@ -38,4 +42,5 @@ exec .venv/bin/self-improve-protein --config "$config" aggregate \
     --results-root "$results_root" \
     --output "$output" \
     --mode "$mode" \
-    "${seed_args[@]}"
+    "${seed_args[@]}" \
+    "${r5_gate_args[@]}"

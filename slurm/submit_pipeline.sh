@@ -15,6 +15,9 @@ export SLURM_CONF="$SI_SLURM_CONF"
 export OPENBLAS_CORETYPE=Haswell
 export SI_CONFIG="${SI_CONFIG:-${SI_REPO_ROOT}/configs/v0.yaml}"
 export SI_MANIFEST="${SI_MANIFEST:-${SI_ARTIFACT_ROOT}/studies/v0/data_manifest.json}"
+export SI_PROCESSED_ROOT="${SI_PROCESSED_ROOT:-${SI_DATA_ROOT}/processed/v0}"
+export SI_EMBEDDING_ROOT="${SI_EMBEDDING_ROOT:-${SI_DATA_ROOT}/embeddings/v0}"
+export SI_RESULTS_ROOT="${SI_RESULTS_ROOT:-${SI_ARTIFACT_ROOT}/studies/v0}"
 export SI_MODE="${SI_MODE:-development}"
 if [[ "$SI_MODE" != "confirmatory" && "$SI_MODE" != "development" ]]; then
     echo "SI_MODE must be confirmatory or development" >&2
@@ -49,41 +52,12 @@ fi
 if [[ "$SI_MODE" == "confirmatory" ]]; then
     : "${SI_R5_GATE:?confirmatory submission requires SI_R5_GATE}"
     export SI_R5_GATE
-    .venv/bin/python - "$SI_R5_GATE" "$SI_MANIFEST" "$SI_CONFIG" <<'PY'
-import json
-import subprocess
-import sys
-
-from self_improve_protein.config import load_protocol
-from self_improve_protein.experiment import canonical_protocol_digest
-from self_improve_protein.provenance import sha256_file
-
-gate_path, manifest_path, config_path = sys.argv[1:]
-with open(gate_path, encoding="utf-8") as handle:
-    gate = json.load(handle)
-protocol_digest = canonical_protocol_digest(load_protocol(config_path))
-for command in (
-    ["git", "diff", "--quiet", "--"],
-    ["git", "diff", "--cached", "--quiet", "--"],
-):
-    subprocess.run(command, check=True)
-git_commit = subprocess.run(
-    ["git", "rev-parse", "HEAD"],
-    check=True,
-    capture_output=True,
-    text=True,
-).stdout.strip()
-expected = {
-    "git_commit": git_commit,
-    "kind": "r5_gate",
-    "manifest_sha256": sha256_file(manifest_path),
-    "protocol_digest": protocol_digest,
-    "schema_version": 1,
-    "status": "passed",
-}
-if gate != expected:
-    raise SystemExit("SI_R5_GATE is not a passed gate for this protocol/manifest/git")
-PY
+    .venv/bin/self-improve-protein --config "$SI_CONFIG" verify \
+        --manifest "$SI_MANIFEST" \
+        --processed-root "$SI_PROCESSED_ROOT" \
+        --embedding-root "$SI_EMBEDDING_ROOT" \
+        --results-root "$SI_RESULTS_ROOT" \
+        --r5-gate "$SI_R5_GATE"
 fi
 
 run_id="${SI_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"

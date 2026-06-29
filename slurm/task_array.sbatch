@@ -24,6 +24,11 @@ processed_root="${SI_PROCESSED_ROOT:-${SI_DATA_ROOT}/processed/v0}"
 embedding_root="${SI_EMBEDDING_ROOT:-${SI_DATA_ROOT}/embeddings/v0}"
 results_root="${SI_RESULTS_ROOT:-${SI_ARTIFACT_ROOT}/studies/v0}"
 mode="${SI_MODE:-development}"
+r5_gate_args=()
+if [[ "$mode" == "confirmatory" ]]; then
+    : "${SI_R5_GATE:?confirmatory tasks require SI_R5_GATE}"
+    r5_gate_args=(--r5-gate "$SI_R5_GATE")
+fi
 
 cd "$SI_REPO_ROOT"
 .venv/bin/python -c 'from self_improve_protein.experiment import require_openblas_coretype; require_openblas_coretype("Haswell")'
@@ -33,4 +38,5 @@ exec .venv/bin/self-improve-protein --config "$config" run-task \
     --embedding-root "$embedding_root" \
     --results-root "$results_root" \
     --mode "$mode" \
-    --task-index "$SLURM_ARRAY_TASK_ID"
+    --task-index "$SLURM_ARRAY_TASK_ID" \
+    "${r5_gate_args[@]}"

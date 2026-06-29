@@ -10,6 +10,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+import self_improve_protein.cli as cli_module
 from self_improve_protein.cli import app, load_evaluation_labels
 from self_improve_protein.config import Protocol, load_protocol
 from self_improve_protein.data import (
@@ -226,6 +227,63 @@ def test_console_usage_error_is_one_terminal_json_record_without_false_start() -
     assert len(records) == 1
     assert records[0]["event"] == "terminal"
     assert records[0]["status"] == "error"
+
+
+def test_show_config_exits_zero_without_dummy_subcommand() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "self_improve_protein.cli", "--show-config"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["event"] == "config"
+    assert len(payload["protocol_digest"]) == 64
+
+
+def test_console_usage_error_extracts_command_after_global_option_value() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "self_improve_protein.cli",
+            "--config",
+            "configs/v0.yaml",
+            "prepare-data",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    payload = json.loads(completed.stdout)
+    assert payload["command"] == "prepare-data"
+    assert payload["event"] == "terminal"
+    assert payload["status"] == "error"
+
+
+def test_console_action_error_propagates_nonzero_exit(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "self_improve_protein.cli",
+            "verify",
+            "--manifest",
+            str(tmp_path / "missing.json"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    records = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert [record["event"] for record in records] == ["start", "terminal"]
+    assert records[-1]["status"] == "error"
 
 
 def test_dry_run_emits_normalized_records_without_mutation(tmp_path: Path) -> None:
@@ -685,3 +743,105 @@ def test_five_wide_cache_is_not_accepted_as_official_without_bypass(
 
     assert result.exit_code != 0
     assert "locked v0 protocol" in result.output
+
+
+def test_r5_gate_is_written_only_from_reconstructed_two_seed_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _synthetic_workspace(tmp_path)
+    protocol = load_protocol(paths["config"])
+    monkeypatch.setattr(
+        cli_module,
+        "_LOCKED_V0_PROTOCOL_DIGEST",
+        cli_module.canonical_protocol_digest(protocol),
+    )
+    monkeypatch.setattr(cli_module, "_ESM2_35M_EMBEDDING_DIM", 5)
+    monkeypatch.setattr(
+        cli_module,
+        "require_openblas_coretype",
+        lambda expected_core: expected_core,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_git_commit",
+        lambda *, require_clean=False: "a" * 40,
+    )
+    first_args = _run_task_args(paths)
+    first_args.remove("--non-official-bypass")
+    first = RUNNER.invoke(app, first_args)
+    assert first.exit_code == 0, first.output
+    second_args = first_args.copy()
+    second_args[second_args.index("0")] = "1"
+    second = RUNNER.invoke(app, second_args)
+    assert second.exit_code == 0, second.output
+    aggregate_path = tmp_path / "r5-aggregate.json"
+    aggregate_args = _aggregate_args(paths, aggregate_path, seeds=(0, 1))
+    aggregate_args.remove("--non-official-bypass")
+    aggregate_args[aggregate_args.index("20")] = "10000"
+    aggregate = RUNNER.invoke(app, aggregate_args)
+    assert aggregate.exit_code == 0, aggregate.output
+    gate_path = tmp_path / "r5-gate.json"
+    verify_args = [
+        "--config",
+        str(paths["config"]),
+        "verify",
+        "--manifest",
+        str(paths["manifest"]),
+        "--processed-root",
+        str(paths["processed"]),
+        "--embedding-root",
+        str(paths["embeddings"]),
+        "--results-root",
+        str(paths["results"]),
+        "--aggregate-artifact",
+        str(aggregate_path),
+        "--write-r5-gate",
+        str(gate_path),
+    ]
+
+    written = RUNNER.invoke(app, verify_args)
+
+    assert written.exit_code == 0, written.output
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    assert gate["status"] == "passed"
+    assert gate["task_count"] == 2
+    assert gate["method_row_count"] == 10
+    assert [entry["seed"] for entry in gate["task_manifest"]] == [0, 1]
+    confirmatory_args = first_args.copy()
+    confirmatory_args[confirmatory_args.index("BBB")] = "AAA"
+    confirmatory_args[confirmatory_args.index("development")] = "confirmatory"
+    confirmatory_args.extend(("--r5-gate", str(gate_path)))
+    confirmatory = RUNNER.invoke(app, confirmatory_args)
+    assert confirmatory.exit_code == 0, confirmatory.output
+    confirmatory_task = json.loads(
+        (paths["results"] / "tasks" / "AAA" / "seed_0.json").read_text(encoding="utf-8")
+    )
+    assert confirmatory_task["provenance"]["r5_gate_sha256"] == (
+        cli_module.sha256_file(gate_path)
+    )
+    task_path = paths["results"] / "tasks" / "BBB" / "seed_1.json"
+    task = json.loads(task_path.read_text(encoding="utf-8"))
+    task["methods"][0]["mse"] += 1.0
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+
+    invalid = RUNNER.invoke(
+        app,
+        [
+            "--config",
+            str(paths["config"]),
+            "verify",
+            "--manifest",
+            str(paths["manifest"]),
+            "--processed-root",
+            str(paths["processed"]),
+            "--embedding-root",
+            str(paths["embeddings"]),
+            "--results-root",
+            str(paths["results"]),
+            "--r5-gate",
+            str(gate_path),
+        ],
+    )
+
+    assert invalid.exit_code != 0

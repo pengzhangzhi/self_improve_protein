@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -107,6 +108,15 @@ def _mock_submit_environment(
         encoding="utf-8",
     )
     python_path.chmod(0o755)
+    cli_path = repo / ".venv" / "bin" / "self-improve-protein"
+    source_root = (Path.cwd() / "src").absolute()
+    cli_path.write_text(
+        "#!/usr/bin/env bash\n"
+        f'export PYTHONPATH="{source_root}${{PYTHONPATH:+:${{PYTHONPATH}}}}"\n'
+        f'exec "{active_python}" -m self_improve_protein.cli "$@"\n',
+        encoding="utf-8",
+    )
+    cli_path.chmod(0o755)
     config_dir = repo / "configs"
     config_dir.mkdir()
     (config_dir / "v0.yaml").write_bytes(Path("configs/v0.yaml").read_bytes())
@@ -229,6 +239,64 @@ def test_confirmatory_submit_requires_passed_r5_gate_before_any_sbatch(
 
     assert completed.returncode != 0
     assert "SI_R5_GATE" in completed.stderr
+    assert not calls_path.exists()
+    assert not (repo / "local" / "slurm" / "test-run").exists()
+
+
+def test_forged_field_only_r5_gate_without_evidence_submits_no_jobs(
+    tmp_path: Path,
+) -> None:
+    env, repo, calls_path = _mock_submit_environment(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "add", "configs/v0.yaml"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "test config"], cwd=repo, check=True)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    gate = tmp_path / "forged-r5.json"
+    git_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    gate.write_text(
+        json.dumps(
+            {
+                "git_commit": git_commit,
+                "kind": "r5_gate",
+                "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                "protocol_digest": (
+                    "0b2a74ff76b8c7c508ceea16b004a1c128ba15704138138d49b2c153bcbfa49a"
+                ),
+                "schema_version": 1,
+                "status": "passed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    env.update(
+        SI_MODE="confirmatory",
+        SI_MANIFEST=str(manifest),
+        SI_R5_GATE=str(gate),
+    )
+    script = (SLURM / "submit_pipeline.sh").resolve()
+
+    completed = subprocess.run(
+        ["bash", str(script)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
     assert not calls_path.exists()
     assert not (repo / "local" / "slurm" / "test-run").exists()
 

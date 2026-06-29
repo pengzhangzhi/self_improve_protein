@@ -70,7 +70,8 @@ from self_improve_protein.provenance import (
 app = typer.Typer(
     name="self-improve-protein",
     help="Run the provenance-locked ProteinGym low-label experiment.",
-    no_args_is_help=True,
+    invoke_without_command=True,
+    no_args_is_help=False,
     pretty_exceptions_enable=False,
 )
 
@@ -201,6 +202,9 @@ def main(
                 "schema_version": _SCHEMA_VERSION,
             }
         )
+        raise typer.Exit()
+    if context.invoked_subcommand is None:
+        typer.echo(context.get_help())
         raise typer.Exit()
 
 
@@ -843,6 +847,7 @@ def _build_task_payload(
     seed: int,
     mode: Literal["confirmatory", "development"],
     non_official_bypass: bool,
+    r5_gate_sha256: str | None,
 ) -> dict[str, object]:
     """Recompute one complete task artifact from its current pinned inputs."""
     _validate_execution_policy(
@@ -850,6 +855,10 @@ def _build_task_payload(
         mode=mode,
         non_official_bypass=non_official_bypass,
     )
+    if mode == "confirmatory" and not _is_sha256(r5_gate_sha256):
+        raise ValueError("confirmatory execution requires a validated R5 gate")
+    if mode == "development" and r5_gate_sha256 is not None:
+        raise ValueError("development execution cannot consume an R5 gate")
     git_commit = _git_commit(require_clean=not non_official_bypass)
     expected_assays = (
         manifest.confirmatory_ids
@@ -981,6 +990,7 @@ def _build_task_payload(
             "git_commit": git_commit,
             "manifest_sha256": sha256_file(manifest_path),
             "processed_sha256": sha256_file(parquet_path),
+            "r5_gate_sha256": r5_gate_sha256,
             "sources": {
                 "metadata": protocol.metadata_sha256,
                 "scores": protocol.zero_shot_scores_sha256,
@@ -1034,6 +1044,7 @@ def run_task(
             help="Development/tests only: skip the pre-start OpenBLAS core assertion.",
         ),
     ] = False,
+    r5_gate: Annotated[Path | None, typer.Option("--r5-gate")] = None,
 ) -> None:
     """Fit and evaluate one leakage-staged assay-seed task."""
     options = _options(context)
@@ -1055,6 +1066,22 @@ def run_task(
             mode=mode,
             non_official_bypass=non_official_bypass,
         )
+        if mode == "confirmatory":
+            if r5_gate is None:
+                raise ValueError("confirmatory execution requires --r5-gate")
+            gate_digest = _validated_r5_gate_digest(
+                r5_gate,
+                protocol=protocol,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                processed_root=processed_root,
+                embedding_root=embedding_root,
+                results_root=results_root,
+            )
+        else:
+            if r5_gate is not None:
+                raise ValueError("development execution cannot consume --r5-gate")
+            gate_digest = None
         destination = (
             results_root / "tasks" / resolved_assay / f"seed_{resolved_seed}.json"
         )
@@ -1062,6 +1089,7 @@ def run_task(
             "assay_id": resolved_assay,
             "output": str(destination),
             "seed": resolved_seed,
+            "r5_gate": str(r5_gate) if r5_gate is not None else None,
             "stages": [
                 "validate_inputs",
                 "load_labeled_only",
@@ -1083,6 +1111,7 @@ def run_task(
             seed=resolved_seed,
             mode=mode,
             non_official_bypass=non_official_bypass,
+            r5_gate_sha256=gate_digest,
         )
         created = _write_json_once(destination, payload)
         return {
@@ -1144,6 +1173,7 @@ def _build_aggregate_payload(
     seeds: Sequence[int],
     bootstrap_resamples: int,
     non_official_bypass: bool,
+    r5_gate_sha256: str | None,
 ) -> dict[str, object]:
     """Independently rebuild every task and all aggregate-derived content."""
     _validate_execution_policy(
@@ -1151,6 +1181,10 @@ def _build_aggregate_payload(
         mode=mode,
         non_official_bypass=non_official_bypass,
     )
+    if mode == "confirmatory" and not _is_sha256(r5_gate_sha256):
+        raise ValueError("confirmatory aggregation requires a validated R5 gate")
+    if mode == "development" and r5_gate_sha256 is not None:
+        raise ValueError("development aggregation cannot consume an R5 gate")
     if type(bootstrap_resamples) is not int or bootstrap_resamples <= 0:
         raise ValueError("bootstrap_resamples must be a positive integer")
     if mode == "confirmatory" and bootstrap_resamples != 10_000:
@@ -1184,6 +1218,7 @@ def _build_aggregate_payload(
                 seed=seed,
                 mode=mode,
                 non_official_bypass=non_official_bypass,
+                r5_gate_sha256=r5_gate_sha256,
             )
             _require_exact_payload(actual, expected, artifact_kind="task")
             provenance = cast(dict[str, object], actual["provenance"])
@@ -1282,6 +1317,7 @@ def _build_aggregate_payload(
             "git_commit": git_commits.pop(),
             "manifest_sha256": sha256_file(manifest_path),
             "protocol_digest": canonical_protocol_digest(protocol),
+            "r5_gate_sha256": r5_gate_sha256,
             "task_count": len(task_manifest),
             "task_manifest": task_manifest,
         },
@@ -1289,6 +1325,116 @@ def _build_aggregate_payload(
         "v0_verdict": verdict,
     }
     return cast(dict[str, object], _jsonable(payload))
+
+
+def _build_r5_gate_payload(
+    *,
+    protocol: Protocol,
+    manifest: DataManifest,
+    manifest_path: Path,
+    processed_root: Path,
+    embedding_root: Path,
+    results_root: Path,
+    aggregate_artifact: Path,
+) -> dict[str, object]:
+    """Reconstruct the exact official R5 evidence and derive its promotion gate."""
+    actual = _load_unique_json(aggregate_artifact)
+    if (
+        actual.get("schema_version") != 1
+        or actual.get("kind") != "aggregate_result"
+        or actual.get("mode") != "development"
+    ):
+        raise ValueError("R5 aggregate must be a development aggregate artifact")
+    analysis = actual.get("analysis")
+    grid = actual.get("grid")
+    execution = actual.get("execution")
+    provenance = actual.get("provenance")
+    if (
+        not isinstance(analysis, dict)
+        or analysis.get("bootstrap_resamples") != 10_000
+        or not isinstance(grid, dict)
+        or grid.get("assay_ids") != [manifest.development_id]
+        or grid.get("seeds") != [0, 1]
+        or not isinstance(execution, dict)
+        or execution.get("official") is not True
+        or execution.get("bypass") is not None
+        or not isinstance(provenance, dict)
+    ):
+        raise ValueError("R5 aggregate is not the exact official two-seed grid")
+    expected = _build_aggregate_payload(
+        protocol=protocol,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        processed_root=processed_root,
+        embedding_root=embedding_root,
+        results_root=results_root,
+        mode="development",
+        seeds=(0, 1),
+        bootstrap_resamples=10_000,
+        non_official_bypass=False,
+        r5_gate_sha256=None,
+    )
+    _require_exact_payload(actual, expected, artifact_kind="R5 aggregate")
+    long_results = expected.get("long_results")
+    task_manifest = provenance.get("task_manifest")
+    if (
+        not isinstance(long_results, list)
+        or len(long_results) != 10
+        or provenance.get("task_count") != 2
+        or not isinstance(task_manifest, list)
+        or len(task_manifest) != 2
+        or [entry.get("seed") for entry in task_manifest if isinstance(entry, dict)]
+        != [0, 1]
+    ):
+        raise ValueError("R5 evidence must contain two tasks and ten method rows")
+    payload: dict[str, object] = {
+        "aggregate": {
+            "path": str(aggregate_artifact.resolve()),
+            "sha256": sha256_file(aggregate_artifact),
+        },
+        "git_commit": provenance["git_commit"],
+        "kind": "r5_gate",
+        "manifest_sha256": provenance["manifest_sha256"],
+        "method_row_count": 10,
+        "numerical_runtime": execution["numerical_runtime"],
+        "protocol_digest": provenance["protocol_digest"],
+        "schema_version": 1,
+        "status": "passed",
+        "task_count": 2,
+        "task_manifest": task_manifest,
+    }
+    return cast(dict[str, object], _jsonable(payload))
+
+
+def _validated_r5_gate_digest(
+    gate_path: Path,
+    *,
+    protocol: Protocol,
+    manifest: DataManifest,
+    manifest_path: Path,
+    processed_root: Path,
+    embedding_root: Path,
+    results_root: Path,
+) -> str:
+    """Reload and independently reconstruct every artifact bound by an R5 gate."""
+    actual = _load_unique_json(gate_path)
+    aggregate = actual.get("aggregate")
+    if not isinstance(aggregate, dict) or not isinstance(aggregate.get("path"), str):
+        raise ValueError("R5 gate does not identify its aggregate evidence")
+    aggregate_path = Path(cast(str, aggregate["path"]))
+    if not aggregate_path.is_absolute():
+        raise ValueError("R5 aggregate evidence path must be absolute")
+    expected = _build_r5_gate_payload(
+        protocol=protocol,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        processed_root=processed_root,
+        embedding_root=embedding_root,
+        results_root=results_root,
+        aggregate_artifact=aggregate_path,
+    )
+    _require_exact_payload(actual, expected, artifact_kind="R5 gate")
+    return sha256_file(gate_path)
 
 
 @app.command("aggregate")
@@ -1312,6 +1458,7 @@ def aggregate(
         bool,
         typer.Option("--non-official-bypass"),
     ] = False,
+    r5_gate: Annotated[Path | None, typer.Option("--r5-gate")] = None,
 ) -> None:
     """Rebuild an exact task grid and emit clustered tables and diagnostics."""
     options = _options(context)
@@ -1326,6 +1473,22 @@ def aggregate(
             mode=mode,
             non_official_bypass=non_official_bypass,
         )
+        if mode == "confirmatory":
+            if r5_gate is None:
+                raise ValueError("confirmatory aggregation requires --r5-gate")
+            gate_digest = _validated_r5_gate_digest(
+                r5_gate,
+                protocol=protocol,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                processed_root=processed_root,
+                embedding_root=embedding_root,
+                results_root=results_root,
+            )
+        else:
+            if r5_gate is not None:
+                raise ValueError("development aggregation cannot consume --r5-gate")
+            gate_digest = None
         _validated_aggregate_seeds(protocol, requested_seeds, mode=mode)
         assay_ids = (
             manifest.confirmatory_ids
@@ -1343,6 +1506,7 @@ def aggregate(
                     "assay_ids": list(assay_ids),
                     "mode": mode,
                     "output": str(output),
+                    "r5_gate": str(r5_gate) if r5_gate is not None else None,
                     "seeds": list(requested_seeds),
                     "task_artifacts": [str(path) for path in expected_paths],
                 }
@@ -1358,6 +1522,7 @@ def aggregate(
             seeds=requested_seeds,
             bootstrap_resamples=bootstrap_resamples,
             non_official_bypass=non_official_bypass,
+            r5_gate_sha256=gate_digest,
         )
         created = _write_json_once(output, payload)
         long_results = cast(list[object], payload["long_results"])
@@ -1381,6 +1546,7 @@ def _verify_task_context(
     processed_root: Path,
     embedding_root: Path,
     non_official_bypass: bool,
+    r5_gate_sha256: str | None,
 ) -> None:
     actual = _load_unique_json(path)
     _validate_task_payload(actual)
@@ -1398,6 +1564,7 @@ def _verify_task_context(
         seed=seed,
         mode=mode,
         non_official_bypass=non_official_bypass,
+        r5_gate_sha256=r5_gate_sha256,
     )
     _require_exact_payload(actual, expected, artifact_kind="task")
 
@@ -1413,6 +1580,11 @@ def verify(
     aggregate_artifact: Annotated[
         Path | None,
         typer.Option("--aggregate-artifact"),
+    ] = None,
+    r5_gate: Annotated[Path | None, typer.Option("--r5-gate")] = None,
+    write_r5_gate: Annotated[
+        Path | None,
+        typer.Option("--write-r5-gate"),
     ] = None,
     runtime_only: Annotated[bool, typer.Option("--runtime-only")] = False,
     non_official_bypass: Annotated[
@@ -1434,6 +1606,8 @@ def verify(
                     results_root,
                     task_artifact,
                     aggregate_artifact,
+                    r5_gate,
+                    write_r5_gate,
                 )
             ):
                 raise ValueError(
@@ -1452,8 +1626,10 @@ def verify(
             "embedding_root": str(embedding_root) if embedding_root else None,
             "manifest": str(manifest_path),
             "processed_root": str(processed_root) if processed_root else None,
+            "r5_gate": str(r5_gate) if r5_gate else None,
             "results_root": str(results_root) if results_root else None,
             "task_artifact": str(task_artifact) if task_artifact else None,
+            "write_r5_gate": str(write_r5_gate) if write_r5_gate else None,
         }
         if options.dry_run:
             return {"plan": plan}
@@ -1468,6 +1644,26 @@ def verify(
         if not non_official_bypass:
             require_openblas_coretype("Haswell")
         verified = ["config", "manifest"]
+        if r5_gate is not None and write_r5_gate is not None:
+            raise ValueError("--r5-gate and --write-r5-gate are mutually exclusive")
+        if r5_gate is not None:
+            if processed_root is None or embedding_root is None or results_root is None:
+                raise ValueError(
+                    "R5 gate verification requires --processed-root, "
+                    "--embedding-root, and --results-root"
+                )
+            gate_digest = _validated_r5_gate_digest(
+                r5_gate,
+                protocol=protocol,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                processed_root=processed_root,
+                embedding_root=embedding_root,
+                results_root=results_root,
+            )
+            verified.append("r5_gate")
+        else:
+            gate_digest = None
         for record in manifest.selected_assays:
             if processed_root is not None:
                 _load_identity_frame(
@@ -1508,6 +1704,7 @@ def verify(
                 processed_root=processed_root,
                 embedding_root=embedding_root,
                 non_official_bypass=non_official_bypass,
+                r5_gate_sha256=gate_digest,
             )
             verified.append("task")
         if aggregate_artifact is not None:
@@ -1550,6 +1747,7 @@ def verify(
                 seeds=cast(list[int], aggregate_seeds),
                 bootstrap_resamples=cast(int, analysis["bootstrap_resamples"]),
                 non_official_bypass=non_official_bypass,
+                r5_gate_sha256=gate_digest,
             )
             _require_exact_payload(
                 aggregate_payload,
@@ -1557,19 +1755,69 @@ def verify(
                 artifact_kind="aggregate",
             )
             verified.append("aggregate")
-        return {"verified": verified}
+        terminal: dict[str, object] = {"verified": verified}
+        if write_r5_gate is not None:
+            if non_official_bypass:
+                raise ValueError("R5 gate generation forbids --non-official-bypass")
+            if (
+                aggregate_artifact is None
+                or processed_root is None
+                or embedding_root is None
+                or results_root is None
+            ):
+                raise ValueError(
+                    "R5 gate generation requires --aggregate-artifact, "
+                    "--processed-root, --embedding-root, and --results-root"
+                )
+            gate_payload = _build_r5_gate_payload(
+                protocol=protocol,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                processed_root=processed_root,
+                embedding_root=embedding_root,
+                results_root=results_root,
+                aggregate_artifact=aggregate_artifact,
+            )
+            created = _write_json_once(write_r5_gate, gate_payload)
+            terminal.update(
+                r5_gate_artifact=str(write_r5_gate),
+                r5_gate_created=created,
+                r5_gate_sha256=sha256_file(write_r5_gate),
+            )
+        return terminal
 
     _run_command("verify", dry_run=options.dry_run, action=action)
+
+
+def _command_from_argv(arguments: Sequence[str]) -> str | None:
+    commands = {"prepare-data", "embed-assay", "run-task", "aggregate", "verify"}
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--config":
+            index += 2
+            continue
+        if argument.startswith("--config=") or argument in {
+            "--dry-run",
+            "--show-config",
+            "--help",
+        }:
+            index += 1
+            continue
+        return argument if argument in commands else None
+    return None
 
 
 def cli_main() -> None:
     """Run Typer while normalizing parse-time usage failures to JSON."""
     try:
-        app(standalone_mode=False)
+        exit_code = app(standalone_mode=False)
+        if type(exit_code) is int:
+            raise SystemExit(exit_code)
     except _click.ClickException as error:
         _emit(
             {
-                "command": sys.argv[1] if len(sys.argv) > 1 else None,
+                "command": _command_from_argv(sys.argv[1:]),
                 "error": error.format_message(),
                 "error_type": type(error).__name__,
                 "event": "terminal",
