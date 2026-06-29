@@ -94,7 +94,7 @@ Run: `git add pyproject.toml .gitignore LICENSE README.md configs src/self_impro
 
 - [ ] **Step 1: Write failing algebra tests**
 
-Cover: supervised normal equations; `g_L + lambda * theta == 0`; weighted solve uses `(sum weights) * lambda`; vectorized and explicit scores match; finite-difference labeled-loss derivative equals `-score`; self-teacher scores tie at a non-positive value; full-rank OLS scores are zero; no-Hessian vectorization matches explicit gradients.
+Cover: supervised normal equations; `g_L + lambda * theta == 0`; weighted solve uses `(sum weights) * lambda`; vectorized and explicit scores match; finite-difference labeled-loss derivative equals `-score`; self-teacher scores tie at a non-positive value; full-rank OLS scores are zero; no-Hessian vectorization matches explicit gradients; and simultaneous feature scaling with `lambda` and `rho` scaling by the squared factor preserves predictions and score ordering.
 
 ```python
 def test_self_teacher_is_constant_nonpositive(ridge_case):
@@ -229,7 +229,7 @@ Run: `git add src/self_improve_protein/embeddings.py tests/test_embeddings.py &&
 
 - [ ] **Step 1: Write failing end-to-end synthetic task tests**
 
-Define `FitInputs` with labeled features/labels, unlabeled features, labeled/unlabeled teacher scores, test features, and stable hashes—but no unlabeled/test labels. Define `EvaluationLabels` separately. Test all four methods, equal pseudo count and labels, deterministic selection, selection invariance after hidden-label permutation, and exact weighted normal equations.
+Define `FitInputs` with labeled features/labels, unlabeled features, labeled/unlabeled teacher scores, test features, and stable hashes—but no unlabeled/test labels. Define `EvaluationLabels` separately. Test all four confirmatory methods plus the separately carded no-Hessian method, equal pseudo count and labels, deterministic selection, selection invariance after hidden-label permutation, and exact weighted normal equations.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -261,7 +261,7 @@ Run: `git add src/self_improve_protein/experiment.py tests/test_experiment.py &&
 
 - [ ] **Step 1: Write failing metric and inference tests**
 
-Copy small expected values from the pinned ProteinGym v1.3 `calc_ndcg` behavior; test Spearman constant handling and MSE argument order. For analysis, use an eight-assay toy table to test within-assay averaging, `sd / sqrt(8)`, exact enumeration of 256 sign flips, deterministic hierarchical bootstrap, win counts, and failure on missing/duplicate tasks.
+Copy small expected values from the pinned ProteinGym v1.3 `calc_ndcg` behavior; test Spearman constant handling and MSE argument order. For analysis, use an eight-assay toy table to test within-assay averaging, `sd / sqrt(8)`, exact enumeration of 256 sign flips, deterministic hierarchical bootstrap, win counts, distinct selection/practical-self-improvement verdicts, and failure on missing/duplicate tasks.
 
 - [ ] **Step 2: Run and verify RED**
 

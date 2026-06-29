@@ -12,7 +12,7 @@
 
 **Success:** Positive mean primary gain, at least 25/40 task wins, and at least 5/8 assay-mean wins.
 
-**Guardrails:** No non-finite tasks; selections and fitted parameters are invariant to hidden-label perturbation; all pseudo methods use identical labels/count/weight; report MSE and NDCG@10% without using them to overturn the primary decision.
+**Guardrails:** No non-finite tasks; selections and fitted parameters are invariant to hidden-label perturbation; all pseudo methods use identical labels/count/weight; report MSE and NDCG@10% without using them to overturn the primary decision. Report practical self-improvement only if `ours - supervised` assay-macro Spearman is positive.
 
 **Data / split:** ProteinGym v1.3 substitutions from Zenodo record `15293562`, literal teacher column `ESM1v_ensemble`, first eight lexicographically sorted assays with at least 6,000 usable variants and length at most 512. Per seed: 96 labeled, 2,000 unlabeled, 1,000 test from a fixed hash-sorted 6,000-row working set. The ninth eligible assay is development-only.
 
@@ -24,4 +24,4 @@
 
 **Start rung:** R1 static/import/config after this R0 card is committed.
 
-**Exploratory-only:** Teacher quality, hidden pseudo-label error, score/error correlation, supervised and top-teacher comparisons, no-Hessian behavior, regularization/locality sweeps, cross-fitted scores, and results on any assay examined during development.
+**Exploratory-only:** Teacher quality, hidden pseudo-label error, score/error correlation, oracle-influence alignment, effective-rank relationships, supervised and top-teacher comparisons, the separately carded no-Hessian result, regularization/locality/PCA sweeps, cross-fitted scores, and results on any assay examined during development.

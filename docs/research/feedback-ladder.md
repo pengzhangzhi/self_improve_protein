@@ -42,7 +42,7 @@
 
 ## R5: Development-only pilot
 
-**Check:** On the ninth eligible assay and two fixed development seeds, all four methods complete at full task sizes; teacher and predictions vary; metrics and score diagnostics are finite; independent reruns match.
+**Check:** On the ninth eligible assay and two fixed development seeds, all four confirmatory methods plus the separately carded no-Hessian method complete at full task sizes; teacher and predictions vary; metrics and score diagnostics are finite; independent reruns match.
 
 **Artifact:** `artifacts/verification/r5/` with the frozen development manifest, two task shards, aggregate table, and a pilot note.
 
@@ -50,7 +50,7 @@
 
 ## R6: Full confirmatory study
 
-**Check:** All 40 predeclared assay-seed tasks complete for the four methods under one immutable manifest and git revision.
+**Check:** All 40 predeclared assay-seed tasks complete for the four confirmatory methods and the separately carded no-Hessian method under one immutable manifest and git revision.
 
 **Artifact:** `artifacts/studies/v0/` with 40 validated task shards, predictions, diagnostics, aggregate tables, exact sign-flip result, hierarchical bootstrap, and completion manifest.
 

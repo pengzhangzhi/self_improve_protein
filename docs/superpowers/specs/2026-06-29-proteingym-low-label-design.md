@@ -129,7 +129,7 @@ The factor `D * lambda` is part of the method and must not be replaced by a cons
 
 The four confirmatory methods are supervised-only, random pseudo, top-teacher pseudo, and full score-selected pseudo. All pseudo methods use the same calibrated labels, \(q=192\), \(w=0.1\), features, and solver. Random selection uses its independent deterministic stream. Top-teacher and score ties use the same stable sequence-hash rule.
 
-The self-teacher, no-Hessian, cross-fitted, positive-only, regularization, locality, and teacher-student-disagreement variants are separate negative-control or exploratory cards. They cannot alter the v0 result.
+The self-teacher, no-Hessian, cross-fitted, positive-only, regularization, locality, and teacher-student-disagreement variants are separate negative-control or exploratory cards. They cannot alter the v0 result. The no-Hessian card is executed in the same task wave because it is nearly free and was predeclared before ProteinGym method outcomes, but it is analyzed as a separate mechanism experiment.
 
 ### Metrics and inference
 
@@ -145,11 +145,13 @@ The v0 success rule is fixed before results:
 - at least 25 of 40 task-level pairs favor ours; and
 - at least 5 of 8 assay-mean pairs favor ours.
 
-Beating supervised-only and top-teacher is a stronger secondary result, not a substitute for failure against random.
+This rule decides the **selection hypothesis**. A separate **practical self-improvement** label requires the full score to have positive assay-macro Spearman gain over supervised-only. Beating top-teacher is a stronger secondary result. Neither secondary comparison can substitute for failure against random, and beating random while losing to supervised is reported as selection success without practical self-improvement.
 
 ### Required diagnostics
 
-Save teacher test Spearman; score min/max/standard deviation/quantiles/positive fraction/unique count; mean selected score for ours and random; overlap with top-teacher; hidden unlabeled pseudo-label absolute error for analysis only; teacher-student residual distributions; Hessian condition number; effective ridge degrees of freedom; \(\lVert g_L+\lambda\theta_0\rVert\); selection hashes; and random-selection Monte Carlo sensitivity.
+Save teacher test Spearman; score min/max/standard deviation/quantiles/positive fraction/unique count; mean selected score for ours and random; overlap with top-teacher; hidden unlabeled pseudo-label absolute error for analysis only; teacher-student residual distributions; Hessian eigenvalue spectrum, numerical effective rank, condition number, and effective ridge degrees of freedom; \(\lVert g_L+\lambda\theta_0\rVert\); selection hashes; and random-selection Monte Carlo sensitivity.
+
+After predictions and selection hashes are frozen, compute an analysis-only oracle influence score by replacing the labeled outer gradient with the test gradient. Report its rank correlation with the proposed score and the \((H+\rho I)^{-1}\)-metric cosine between labeled and test gradients. These diagnostics explain proxy alignment but never enter selection.
 
 Lower hidden pseudo-label error is not required by the influence argument. It is interpretive evidence, not a success criterion.
 
@@ -179,7 +181,7 @@ The staged R0-R7 gates are defined in `docs/research/feedback-ladder.md`. The co
 
 ## Planned branching after v0
 
-If v0 is positive or ambiguous, run the same locked protocol on all remaining eligible assays except the development assay as an untouched replication. If v0 is negative, preserve that result and open separate exploratory cards in this order: full versus no-Hessian, cross-fitted risk gradient, positive-only matched-cardinality selection, labeled-only regularization choice, locality curves over \(t\), and simple teacher-student disagreement baselines. Any promising exploratory method requires a new untouched assay set or a new benchmark for confirmation.
+If v0 is positive or ambiguous, run the same locked protocol on all remaining eligible assays except the development assay as an untouched replication. If v0 is negative, preserve that result and use the already-predeclared no-Hessian result before opening new exploratory cards in this order: cross-fitted risk gradient, positive-only matched-cardinality selection, labeled-only regularization choice, locality curves over \(t\), PCA/effective-dimension stress tests, and simple teacher-student disagreement baselines. Any promising exploratory method requires a new untouched assay set or a new benchmark for confirmation.
 
 ## Publication
 
