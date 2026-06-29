@@ -1412,9 +1412,8 @@ def _validated_pilot_note(
         or payload.get("kind") != "r5_pilot_note"
         or payload.get("development_only") is not True
         or payload.get("status") != "reviewed"
-        or payload.get("direction") not in {"continue", "stop", "inconclusive"}
-        or payload.get("classification")
-        not in {"positive", "negative", "ambiguous", "plumbing_failure"}
+        or payload.get("direction") != "continue"
+        or payload.get("classification") not in {"positive", "negative", "ambiguous"}
         or not isinstance(caveats, list)
         or not caveats
         or any(not isinstance(value, str) or not value.strip() for value in caveats)

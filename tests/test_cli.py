@@ -824,6 +824,20 @@ def test_r5_gate_is_written_only_from_reconstructed_two_seed_evidence(
     pilot_note.write_text(json.dumps(mismatched_payload), encoding="utf-8")
     mismatched_note = RUNNER.invoke(app, empty_note_args)
     assert mismatched_note.exit_code != 0
+    for direction, classification in (
+        ("stop", "negative"),
+        ("inconclusive", "ambiguous"),
+        ("continue", "plumbing_failure"),
+    ):
+        non_promoting = {
+            **pilot_payload,
+            "direction": direction,
+            "classification": classification,
+        }
+        pilot_note.write_text(json.dumps(non_promoting), encoding="utf-8")
+        rejected = RUNNER.invoke(app, empty_note_args)
+        assert rejected.exit_code != 0
+        assert not gate_path.exists()
     pilot_note.write_text(json.dumps(pilot_payload), encoding="utf-8")
     verify_args.extend(("--pilot-note", str(pilot_note)))
     constant_aggregate_path = tmp_path / "constant-teacher-aggregate.json"
