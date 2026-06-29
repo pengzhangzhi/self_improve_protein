@@ -1327,6 +1327,108 @@ def _build_aggregate_payload(
     return cast(dict[str, object], _jsonable(payload))
 
 
+def _validate_r5_teacher_diagnostics(
+    protocol: Protocol,
+    aggregate_payload: dict[str, object],
+) -> None:
+    diagnostics = aggregate_payload.get("diagnostics")
+    if not isinstance(diagnostics, list) or len(diagnostics) != 2:
+        raise ValueError("R5 evidence must contain two task diagnostics")
+    expected_counts = {
+        "teacher_scores_labeled": protocol.n_labeled,
+        "teacher_scores_unlabeled": protocol.n_unlabeled,
+        "teacher_scores_test": protocol.n_test,
+    }
+    for task_row in diagnostics:
+        if not isinstance(task_row, dict) or not isinstance(
+            task_row.get("diagnostics"), dict
+        ):
+            raise ValueError("R5 task diagnostics are invalid")
+        task_diagnostics = cast(dict[str, object], task_row["diagnostics"])
+        fit = task_diagnostics.get("fit")
+        evaluation = task_diagnostics.get("evaluation")
+        if not isinstance(fit, dict) or not isinstance(evaluation, dict):
+            raise ValueError("R5 fit or evaluation diagnostics are missing")
+        for field, expected_count in expected_counts.items():
+            scores = fit.get(field)
+            if not isinstance(scores, dict):
+                raise ValueError(f"R5 {field} diagnostics are missing")
+            variance = scores.get("variance")
+            if (
+                scores.get("count") != expected_count
+                or scores.get("finite_count") != expected_count
+                or scores.get("finite_fraction") != 1.0
+                or isinstance(variance, bool)
+                or not isinstance(variance, (int, float))
+                or not np.isfinite(float(variance))
+                or float(variance) <= 0.0
+            ):
+                raise ValueError(
+                    f"R5 {field} must have full finite coverage and positive variance"
+                )
+        slope = fit.get("calibration_slope")
+        teacher_spearman = evaluation.get("teacher_test_spearman")
+        varying_slope = (
+            not isinstance(slope, bool)
+            and isinstance(slope, (int, float))
+            and np.isfinite(float(slope))
+            and float(slope) != 0.0
+        )
+        defined_spearman = (
+            isinstance(teacher_spearman, dict)
+            and teacher_spearman.get("defined") is True
+            and isinstance(teacher_spearman.get("value"), (int, float))
+            and not isinstance(teacher_spearman.get("value"), bool)
+            and np.isfinite(float(cast(float, teacher_spearman["value"])))
+        )
+        if not (varying_slope or defined_spearman):
+            raise ValueError("R5 calibrated teacher must have nonzero variation")
+
+
+def _validated_pilot_note(
+    pilot_note_path: Path,
+    *,
+    protocol_digest: object,
+    manifest_sha256: object,
+    git_commit: object,
+) -> dict[str, object]:
+    payload = _load_unique_json(pilot_note_path)
+    required_keys = {
+        "caveats",
+        "classification",
+        "development_only",
+        "direction",
+        "git_commit",
+        "kind",
+        "manifest_sha256",
+        "protocol_digest",
+        "schema_version",
+        "status",
+    }
+    caveats = payload.get("caveats")
+    if (
+        set(payload) != required_keys
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "r5_pilot_note"
+        or payload.get("development_only") is not True
+        or payload.get("status") != "reviewed"
+        or payload.get("direction") not in {"continue", "stop", "inconclusive"}
+        or payload.get("classification")
+        not in {"positive", "negative", "ambiguous", "plumbing_failure"}
+        or not isinstance(caveats, list)
+        or not caveats
+        or any(not isinstance(value, str) or not value.strip() for value in caveats)
+        or payload.get("protocol_digest") != protocol_digest
+        or payload.get("manifest_sha256") != manifest_sha256
+        or payload.get("git_commit") != git_commit
+    ):
+        raise ValueError("pilot note schema or bound identifiers are invalid")
+    return {
+        "path": str(pilot_note_path.resolve()),
+        "sha256": sha256_file(pilot_note_path),
+    }
+
+
 def _build_r5_gate_payload(
     *,
     protocol: Protocol,
@@ -1336,6 +1438,7 @@ def _build_r5_gate_payload(
     embedding_root: Path,
     results_root: Path,
     aggregate_artifact: Path,
+    pilot_note_path: Path,
 ) -> dict[str, object]:
     """Reconstruct the exact official R5 evidence and derive its promotion gate."""
     actual = _load_unique_json(aggregate_artifact)
@@ -1375,6 +1478,7 @@ def _build_r5_gate_payload(
         r5_gate_sha256=None,
     )
     _require_exact_payload(actual, expected, artifact_kind="R5 aggregate")
+    _validate_r5_teacher_diagnostics(protocol, expected)
     long_results = expected.get("long_results")
     task_manifest = provenance.get("task_manifest")
     if (
@@ -1387,6 +1491,12 @@ def _build_r5_gate_payload(
         != [0, 1]
     ):
         raise ValueError("R5 evidence must contain two tasks and ten method rows")
+    pilot_note = _validated_pilot_note(
+        pilot_note_path,
+        protocol_digest=provenance["protocol_digest"],
+        manifest_sha256=provenance["manifest_sha256"],
+        git_commit=provenance["git_commit"],
+    )
     payload: dict[str, object] = {
         "aggregate": {
             "path": str(aggregate_artifact.resolve()),
@@ -1397,6 +1507,7 @@ def _build_r5_gate_payload(
         "manifest_sha256": provenance["manifest_sha256"],
         "method_row_count": 10,
         "numerical_runtime": execution["numerical_runtime"],
+        "pilot_note": pilot_note,
         "protocol_digest": provenance["protocol_digest"],
         "schema_version": 1,
         "status": "passed",
@@ -1419,11 +1530,20 @@ def _validated_r5_gate_digest(
     """Reload and independently reconstruct every artifact bound by an R5 gate."""
     actual = _load_unique_json(gate_path)
     aggregate = actual.get("aggregate")
-    if not isinstance(aggregate, dict) or not isinstance(aggregate.get("path"), str):
+    pilot_note = actual.get("pilot_note")
+    if (
+        not isinstance(aggregate, dict)
+        or not isinstance(aggregate.get("path"), str)
+        or not isinstance(pilot_note, dict)
+        or not isinstance(pilot_note.get("path"), str)
+    ):
         raise ValueError("R5 gate does not identify its aggregate evidence")
     aggregate_path = Path(cast(str, aggregate["path"]))
     if not aggregate_path.is_absolute():
         raise ValueError("R5 aggregate evidence path must be absolute")
+    pilot_note_path = Path(cast(str, pilot_note["path"]))
+    if not pilot_note_path.is_absolute():
+        raise ValueError("R5 pilot note path must be absolute")
     expected = _build_r5_gate_payload(
         protocol=protocol,
         manifest=manifest,
@@ -1432,6 +1552,7 @@ def _validated_r5_gate_digest(
         embedding_root=embedding_root,
         results_root=results_root,
         aggregate_artifact=aggregate_path,
+        pilot_note_path=pilot_note_path,
     )
     _require_exact_payload(actual, expected, artifact_kind="R5 gate")
     return sha256_file(gate_path)
@@ -1586,6 +1707,7 @@ def verify(
         Path | None,
         typer.Option("--write-r5-gate"),
     ] = None,
+    pilot_note: Annotated[Path | None, typer.Option("--pilot-note")] = None,
     runtime_only: Annotated[bool, typer.Option("--runtime-only")] = False,
     non_official_bypass: Annotated[
         bool,
@@ -1608,6 +1730,7 @@ def verify(
                     aggregate_artifact,
                     r5_gate,
                     write_r5_gate,
+                    pilot_note,
                 )
             ):
                 raise ValueError(
@@ -1625,6 +1748,7 @@ def verify(
             else None,
             "embedding_root": str(embedding_root) if embedding_root else None,
             "manifest": str(manifest_path),
+            "pilot_note": str(pilot_note) if pilot_note else None,
             "processed_root": str(processed_root) if processed_root else None,
             "r5_gate": str(r5_gate) if r5_gate else None,
             "results_root": str(results_root) if results_root else None,
@@ -1646,6 +1770,10 @@ def verify(
         verified = ["config", "manifest"]
         if r5_gate is not None and write_r5_gate is not None:
             raise ValueError("--r5-gate and --write-r5-gate are mutually exclusive")
+        if write_r5_gate is not None and pilot_note is None:
+            raise ValueError("R5 gate generation requires --pilot-note")
+        if write_r5_gate is None and pilot_note is not None:
+            raise ValueError("--pilot-note is only valid with --write-r5-gate")
         if r5_gate is not None:
             if processed_root is None or embedding_root is None or results_root is None:
                 raise ValueError(
@@ -1777,6 +1905,7 @@ def verify(
                 embedding_root=embedding_root,
                 results_root=results_root,
                 aggregate_artifact=aggregate_artifact,
+                pilot_note_path=cast(Path, pilot_note),
             )
             created = _write_json_once(write_r5_gate, gate_payload)
             terminal.update(

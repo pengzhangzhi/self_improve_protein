@@ -800,6 +800,65 @@ def test_r5_gate_is_written_only_from_reconstructed_two_seed_evidence(
         str(gate_path),
     ]
 
+    missing_note = RUNNER.invoke(app, verify_args)
+    assert missing_note.exit_code != 0
+    assert not gate_path.exists()
+    pilot_note = tmp_path / "pilot-note.json"
+    pilot_payload = {
+        "caveats": ["development evidence is not a confirmatory endpoint"],
+        "classification": "positive",
+        "development_only": True,
+        "direction": "continue",
+        "git_commit": "a" * 40,
+        "kind": "r5_pilot_note",
+        "manifest_sha256": cli_module.sha256_file(paths["manifest"]),
+        "protocol_digest": cli_module.canonical_protocol_digest(protocol),
+        "schema_version": 1,
+        "status": "reviewed",
+    }
+    pilot_note.write_text("", encoding="utf-8")
+    empty_note_args = [*verify_args, "--pilot-note", str(pilot_note)]
+    empty_note = RUNNER.invoke(app, empty_note_args)
+    assert empty_note.exit_code != 0
+    mismatched_payload = {**pilot_payload, "manifest_sha256": "f" * 64}
+    pilot_note.write_text(json.dumps(mismatched_payload), encoding="utf-8")
+    mismatched_note = RUNNER.invoke(app, empty_note_args)
+    assert mismatched_note.exit_code != 0
+    pilot_note.write_text(json.dumps(pilot_payload), encoding="utf-8")
+    verify_args.extend(("--pilot-note", str(pilot_note)))
+    constant_aggregate_path = tmp_path / "constant-teacher-aggregate.json"
+    constant_aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
+    for task_row in constant_aggregate["diagnostics"]:
+        fit_diagnostics = task_row["diagnostics"]["fit"]
+        for field in (
+            "teacher_scores_labeled",
+            "teacher_scores_unlabeled",
+            "teacher_scores_test",
+        ):
+            fit_diagnostics[field]["variance"] = 0.0
+    constant_aggregate_path.write_text(
+        json.dumps(constant_aggregate),
+        encoding="utf-8",
+    )
+    real_build_aggregate = cli_module._build_aggregate_payload
+    monkeypatch.setattr(
+        cli_module,
+        "_build_aggregate_payload",
+        lambda **kwargs: constant_aggregate,
+    )
+    with pytest.raises(ValueError, match="positive variance"):
+        cli_module._build_r5_gate_payload(
+            protocol=protocol,
+            manifest=cli_module.load_data_manifest(paths["manifest"]),
+            manifest_path=paths["manifest"],
+            processed_root=paths["processed"],
+            embedding_root=paths["embeddings"],
+            results_root=paths["results"],
+            aggregate_artifact=constant_aggregate_path,
+            pilot_note_path=pilot_note,
+        )
+    monkeypatch.setattr(cli_module, "_build_aggregate_payload", real_build_aggregate)
+
     written = RUNNER.invoke(app, verify_args)
 
     assert written.exit_code == 0, written.output
@@ -808,6 +867,8 @@ def test_r5_gate_is_written_only_from_reconstructed_two_seed_evidence(
     assert gate["task_count"] == 2
     assert gate["method_row_count"] == 10
     assert [entry["seed"] for entry in gate["task_manifest"]] == [0, 1]
+    assert gate["pilot_note"]["path"] == str(pilot_note.resolve())
+    assert gate["pilot_note"]["sha256"] == cli_module.sha256_file(pilot_note)
     confirmatory_args = first_args.copy()
     confirmatory_args[confirmatory_args.index("BBB")] = "AAA"
     confirmatory_args[confirmatory_args.index("development")] = "confirmatory"
@@ -820,6 +881,27 @@ def test_r5_gate_is_written_only_from_reconstructed_two_seed_evidence(
     assert confirmatory_task["provenance"]["r5_gate_sha256"] == (
         cli_module.sha256_file(gate_path)
     )
+    pilot_note.write_text("{}\n", encoding="utf-8")
+    mutated_note = RUNNER.invoke(
+        app,
+        [
+            "--config",
+            str(paths["config"]),
+            "verify",
+            "--manifest",
+            str(paths["manifest"]),
+            "--processed-root",
+            str(paths["processed"]),
+            "--embedding-root",
+            str(paths["embeddings"]),
+            "--results-root",
+            str(paths["results"]),
+            "--r5-gate",
+            str(gate_path),
+        ],
+    )
+    assert mutated_note.exit_code != 0
+    pilot_note.write_text(json.dumps(pilot_payload), encoding="utf-8")
     task_path = paths["results"] / "tasks" / "BBB" / "seed_1.json"
     task = json.loads(task_path.read_text(encoding="utf-8"))
     task["methods"][0]["mse"] += 1.0
