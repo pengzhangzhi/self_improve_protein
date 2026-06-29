@@ -13,10 +13,12 @@ def _protocol_data() -> dict[str, object]:
     return load_protocol(CONFIG_PATH).model_dump(mode="python")
 
 
-def test_package_does_not_publish_console_script_before_cli_exists() -> None:
+def test_package_publishes_reviewed_console_script() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "scripts" not in pyproject["project"]
+    assert pyproject["project"]["scripts"] == {
+        "self-improve-protein": "self_improve_protein.cli:app"
+    }
 
 
 def test_random_selection_environment_exactly_pins_numpy() -> None:
