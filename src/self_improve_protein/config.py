@@ -101,6 +101,7 @@ class Protocol(BaseModel):
     max_length: int = Field(gt=0, strict=True)
     preprocessing: Preprocessing
     analysis_seed: int = Field(ge=0, strict=True)
+    random_diagnostic_replicates: int = Field(gt=0, strict=True)
 
     @model_validator(mode="after")
     def validate_cardinalities(self) -> Self:

@@ -373,7 +373,7 @@ Submit one A100 smoke job for a small development-assay shard through `slurm/emb
 
 - [ ] **Step 4: Submit and monitor R5**
 
-Embed the full ninth eligible assay and run two full development seeds. Expected: eight method rows total, finite teacher/score/prediction metrics, deterministic rerun hashes, and a written pilot note that does not enter v0 tables.
+Embed the full ninth eligible assay and run two full development seeds. Expected: 10 method rows total (five methods by two development seeds), finite teacher/score/prediction metrics, deterministic rerun hashes, and a written pilot note that does not enter v0 tables.
 
 - [ ] **Step 5: Classify failures at their lowest rung**
 

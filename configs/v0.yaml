@@ -30,3 +30,4 @@ preprocessing:
   label_ddof: 0
 
 analysis_seed: 20260629
+random_diagnostic_replicates: 100

@@ -69,6 +69,7 @@ def test_v0_protocol_has_all_locked_values() -> None:
     assert protocol.seeds == (0, 1, 2, 3, 4)
     assert protocol.assay_count == 8
     assert protocol.max_length == 512
+    assert protocol.random_diagnostic_replicates == 100
 
 
 @pytest.mark.parametrize(
@@ -101,8 +102,7 @@ def test_v0_protocol_has_official_sources_and_preprocessing() -> None:
         "zero_shot_substitutions_scores.zip/content"
     )
     assert protocol.metadata_url == (
-        "https://zenodo.org/api/records/15293562/files/"
-        "DMS_substitutions.csv/content"
+        "https://zenodo.org/api/records/15293562/files/DMS_substitutions.csv/content"
     )
     assert (
         protocol.proteingym_upstream_commit
@@ -150,6 +150,7 @@ def test_protocol_rejects_nonpositive_sizes(field: str) -> None:
         "assay_count",
         "max_length",
         "analysis_seed",
+        "random_diagnostic_replicates",
     ],
 )
 @pytest.mark.parametrize("invalid_value", [True, "1"])
@@ -176,9 +177,7 @@ def test_protocol_rejects_coercible_float_values(
 
 
 @pytest.mark.parametrize("field", ["pseudo_weight", "ridge_lambda", "damping"])
-@pytest.mark.parametrize(
-    "non_finite", [float("nan"), float("inf"), -float("inf")]
-)
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), -float("inf")])
 def test_protocol_rejects_non_finite_float_values(
     field: str, non_finite: float
 ) -> None:
@@ -200,9 +199,7 @@ def test_preprocessing_rejects_coercible_label_ddof(invalid_value: object) -> No
         Protocol.model_validate(data)
 
 
-@pytest.mark.parametrize(
-    "seeds", [[True, 2, 3, 4, 5], [0, "5", 2, 3, 4]]
-)
+@pytest.mark.parametrize("seeds", [[True, 2, 3, 4, 5], [0, "5", 2, 3, 4]])
 def test_protocol_rejects_coercible_seed_elements(seeds: list[object]) -> None:
     data = _protocol_data()
     data["seeds"] = seeds
@@ -233,6 +230,32 @@ def test_protocol_rejects_duplicate_seeds() -> None:
 
     with pytest.raises(ValidationError, match="distinct"):
         Protocol.model_validate(data)
+
+
+@pytest.mark.parametrize("invalid_value", [0, -1, True, "100"])
+def test_protocol_rejects_invalid_random_diagnostic_replicates(
+    invalid_value: object,
+) -> None:
+    data = _protocol_data()
+    data["random_diagnostic_replicates"] = invalid_value
+
+    with pytest.raises(ValidationError, match="random_diagnostic_replicates"):
+        Protocol.model_validate(data)
+
+
+def test_random_diagnostic_is_carded_as_purpose_separated_exploratory() -> None:
+    card = Path("docs/research/experiment-card-v0.md").read_text(encoding="utf-8")
+    assert "random_diagnostic_replicates=100" in card
+    assert "random_diagnostic:{replicate}" in card
+    assert "exploratory" in card.lower()
+
+
+def test_development_pilot_expects_five_methods_by_two_seeds() -> None:
+    plan = Path(
+        "docs/superpowers/plans/2026-06-29-proteingym-v0-implementation.md"
+    ).read_text(encoding="utf-8")
+    assert "Expected: 10 method rows total" in plan
+    assert "Expected: eight method rows total" not in plan
 
 
 def test_protocol_rejects_unknown_fields() -> None:
