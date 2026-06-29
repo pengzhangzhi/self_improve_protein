@@ -1,5 +1,6 @@
 import hashlib
 import inspect
+import json
 import zipfile
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -7,17 +8,24 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from pydantic import ValidationError
 
 from self_improve_protein.data import (
     AssayEligibility,
+    DataManifest,
+    ManifestSource,
+    ManifestSources,
+    SelectedAssayManifest,
     SplitIndices,
     build_working_set,
     filter_usable_variants,
     load_assay_from_archives,
+    load_data_manifest,
     make_split,
     merge_assay_frames,
     row_hash,
     select_eligible_assays,
+    write_data_manifest,
 )
 from self_improve_protein.provenance import derive_seed
 
@@ -72,6 +80,51 @@ def _split_bytes(split: SplitIndices) -> bytes:
     )
     hashes = "\0".join(value for part in hash_parts for value in part).encode()
     return indices + hashes
+
+
+def _manifest_row_hashes(dms_id: str, size: int) -> tuple[str, ...]:
+    hashes = [
+        row_hash(dms_id, f"A{index + 1}C", f"ACDE{index}A") for index in range(size)
+    ]
+    return tuple(sorted(hashes))
+
+
+def _tiny_manifest(working_size: int = 3) -> DataManifest:
+    selected_ids = ("ASSAY_A", "ASSAY_B", "ASSAY_C")
+    return DataManifest(
+        schema_version=1,
+        data_release="ProteinGym-v1.3",
+        teacher_column=TEACHER,
+        sources=ManifestSources(
+            substitutions=ManifestSource(
+                url="https://example.test/substitutions.zip",
+                sha256="a" * 64,
+            ),
+            scores=ManifestSource(
+                url="https://example.test/scores.zip",
+                sha256="b" * 64,
+            ),
+            metadata=ManifestSource(
+                url="https://example.test/metadata.csv",
+                sha256="c" * 64,
+            ),
+        ),
+        upstream_revision="proteingym@abc123",
+        eligible_assay_ids=("ASSAY_A", "ASSAY_B", "ASSAY_C", "ASSAY_D"),
+        confirmatory_ids=("ASSAY_A", "ASSAY_B"),
+        development_id="ASSAY_C",
+        max_length=512,
+        working_size=working_size,
+        selected_assays=tuple(
+            SelectedAssayManifest(
+                dms_id=dms_id,
+                usable_count=working_size + 2,
+                sequence_length=6,
+                row_hashes=_manifest_row_hashes(dms_id, working_size),
+            )
+            for dms_id in selected_ids
+        ),
+    )
 
 
 def test_row_hash_matches_exact_utf8_nul_separated_formula() -> None:
@@ -272,6 +325,18 @@ def test_build_working_set_rejects_insufficient_rows() -> None:
         build_working_set(_usable_frame(5), size=6)
 
 
+def test_build_working_set_rejects_tampered_hash_before_selection() -> None:
+    usable = _usable_frame(8)
+    untampered = build_working_set(usable, size=3)
+    outside_member = usable.loc[
+        ~usable["sequence_hash"].isin(untampered["sequence_hash"])
+    ].index[0]
+    usable.loc[outside_member, "sequence_hash"] = "0" * 64
+
+    with pytest.raises(ValueError, match=r"sequence_hash.*exact row hash"):
+        build_working_set(usable, size=3)
+
+
 @pytest.mark.parametrize("duplicate", ["sequence_hash", "mutated_sequence"])
 def test_build_working_set_rejects_duplicate_hashes_or_sequences(
     duplicate: str,
@@ -334,6 +399,191 @@ def test_load_assay_rejects_missing_exact_archive_member(
 
     with pytest.raises(ValueError, match=missing_pattern):
         load_assay_from_archives(dms_zip, scores_zip, "TINY", TEACHER)
+
+
+def test_data_manifest_atomic_roundtrip_is_byte_deterministic_and_label_free(
+    tmp_path: Path,
+) -> None:
+    manifest = _tiny_manifest()
+    first_path = tmp_path / "nested" / "manifest.json"
+    second_path = tmp_path / "manifest-copy.json"
+
+    write_data_manifest(first_path, manifest)
+    write_data_manifest(second_path, manifest)
+
+    assert first_path.read_bytes() == second_path.read_bytes()
+    assert load_data_manifest(first_path) == manifest
+    payload = json.loads(first_path.read_text(encoding="utf-8"))
+    assert "DMS_score" not in first_path.read_text(encoding="utf-8")
+    assert set(payload["selected_assays"][0]) == {
+        "dms_id",
+        "usable_count",
+        "sequence_length",
+        "row_hashes",
+    }
+    assert list((tmp_path / "nested").iterdir()) == [first_path]
+
+
+def test_data_manifest_is_deeply_immutable_and_forbids_extra_fields() -> None:
+    manifest = _tiny_manifest()
+
+    with pytest.raises(ValidationError, match="frozen"):
+        manifest.teacher_column = "other"  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="frozen"):
+        manifest.sources.substitutions.url = "https://changed.test"  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="frozen"):
+        manifest.selected_assays[0].usable_count = 1  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="extra"):
+        DataManifest.model_validate(
+            {**manifest.model_dump(mode="json"), "DMS_score": [1.0]}
+        )
+    assert isinstance(manifest.eligible_assay_ids, tuple)
+    assert isinstance(manifest.selected_assays, tuple)
+    assert isinstance(manifest.selected_assays[0].row_hashes, tuple)
+
+
+def test_data_manifest_requires_lowercase_sha256_source_digests() -> None:
+    manifest = _tiny_manifest()
+    payload = manifest.model_dump(mode="json")
+    payload["sources"]["scores"]["sha256"] = "B" * 64
+
+    with pytest.raises(ValidationError, match="sha256"):
+        DataManifest.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "eligible_ids",
+    [
+        ["ASSAY_B", "ASSAY_A", "ASSAY_C", "ASSAY_D"],
+        ["ASSAY_A", "ASSAY_A", "ASSAY_C", "ASSAY_D"],
+    ],
+)
+def test_data_manifest_requires_unique_lexically_sorted_eligible_ids(
+    eligible_ids: list[str],
+) -> None:
+    payload = _tiny_manifest().model_dump(mode="json")
+    payload["eligible_assay_ids"] = eligible_ids
+
+    with pytest.raises(ValidationError, match=r"eligible_assay_ids.*unique.*sorted"):
+        DataManifest.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("confirmatory_ids", ["ASSAY_A", "ASSAY_C"]),
+        ("development_id", "ASSAY_D"),
+    ],
+)
+def test_data_manifest_requires_confirmatory_prefix_and_next_development_id(
+    field: str,
+    value: object,
+) -> None:
+    payload = _tiny_manifest().model_dump(mode="json")
+    payload[field] = value
+
+    with pytest.raises(ValidationError, match="eligible assay prefix"):
+        DataManifest.model_validate(payload)
+
+
+def test_data_manifest_selected_records_cover_confirmatory_and_dev_in_order() -> None:
+    payload = _tiny_manifest().model_dump(mode="json")
+    payload["selected_assays"] = [
+        payload["selected_assays"][1],
+        payload["selected_assays"][0],
+        payload["selected_assays"][2],
+    ]
+
+    with pytest.raises(ValidationError, match=r"selected_assays.*coverage"):
+        DataManifest.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("short_hashes", "working_size"),
+        ("duplicate_hashes", "unique"),
+        ("unsorted_hashes", "sorted"),
+        ("insufficient_usable", "usable_count"),
+        ("too_long", "sequence_length"),
+        ("cross_assay_duplicate_hash", "across selected assays"),
+    ],
+)
+def test_data_manifest_validates_selected_working_set_cardinality_and_hashes(
+    mutation: str,
+    message: str,
+) -> None:
+    payload = _tiny_manifest().model_dump(mode="json")
+    first = payload["selected_assays"][0]
+    if mutation == "short_hashes":
+        first["row_hashes"] = first["row_hashes"][:-1]
+    elif mutation == "duplicate_hashes":
+        first["row_hashes"][1] = first["row_hashes"][0]
+    elif mutation == "unsorted_hashes":
+        first["row_hashes"] = list(reversed(first["row_hashes"]))
+    elif mutation == "insufficient_usable":
+        first["usable_count"] = payload["working_size"] - 1
+    elif mutation == "too_long":
+        first["sequence_length"] = payload["max_length"] + 1
+    elif mutation == "cross_assay_duplicate_hash":
+        payload["selected_assays"][1]["row_hashes"] = first["row_hashes"]
+    else:
+        raise AssertionError(f"unknown test mutation {mutation}")
+
+    with pytest.raises(ValidationError, match=message):
+        DataManifest.model_validate(payload)
+
+
+def test_data_manifest_caps_max_length_at_512() -> None:
+    payload = _tiny_manifest().model_dump(mode="json")
+    payload["max_length"] = 513
+
+    with pytest.raises(ValidationError, match="max_length"):
+        DataManifest.model_validate(payload)
+
+
+def test_load_data_manifest_rejects_tampered_working_set_cardinality(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "manifest.json"
+    write_data_manifest(path, _tiny_manifest())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["selected_assays"][0]["row_hashes"].pop()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="working_size"):
+        load_data_manifest(path)
+
+
+def test_load_data_manifest_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    write_data_manifest(path, _tiny_manifest())
+    serialized = path.read_text(encoding="utf-8")
+    marker = '  "schema_version": 1,\n'
+    assert serialized.count(marker) == 1
+    path.write_text(serialized.replace(marker, marker + marker), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"duplicate JSON key.*schema_version"):
+        load_data_manifest(path)
+
+
+@pytest.mark.parametrize("malformed", ["true", "1.0"])
+def test_load_data_manifest_requires_strict_integer_schema_version(
+    tmp_path: Path,
+    malformed: str,
+) -> None:
+    path = tmp_path / "manifest.json"
+    write_data_manifest(path, _tiny_manifest())
+    serialized = path.read_text(encoding="utf-8")
+    marker = '"schema_version": 1'
+    assert serialized.count(marker) == 1
+    path.write_text(
+        serialized.replace(marker, f'"schema_version": {malformed}'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        load_data_manifest(path)
 
 
 def test_select_eligible_assays_uses_lexical_first_eight_and_ninth_dev() -> None:

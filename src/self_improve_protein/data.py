@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import zipfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Annotated, Self, cast
 
 import numpy as np
 import pandas as pd  # type: ignore[import-untyped]
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictStr,
+    StringConstraints,
+    model_validator,
+)
 
-from self_improve_protein.provenance import derive_seed
+from self_improve_protein.provenance import atomic_write_json, derive_seed
 
 _CANONICAL_AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
 _DMS_REQUIRED_COLUMNS = ("mutant", "mutated_sequence", "DMS_score")
@@ -30,6 +39,11 @@ _NONFINITE_STRINGS = frozenset(
         "-infinity",
     }
 )
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
+Sha256Hex = Annotated[
+    str,
+    StringConstraints(strict=True, pattern=_SHA256_PATTERN),
+]
 
 
 def row_hash(dms_id: str, mutant: str, mutated_sequence: str) -> str:
@@ -212,12 +226,13 @@ def build_working_set(usable: pd.DataFrame, size: int) -> pd.DataFrame:
     checked_size = _require_strict_positive_int(size, "size")
     _require_columns(
         usable,
-        ("mutated_sequence", "sequence_hash"),
+        ("dms_id", "mutant", "mutated_sequence", "sequence_hash"),
         "usable assay frame",
     )
     for column in ("sequence_hash", "mutated_sequence"):
         if usable[column].duplicated().any():
             raise ValueError(f"usable assay frame has duplicate {column} values")
+    _validate_exact_sequence_hashes(usable)
     if len(usable) < checked_size:
         raise ValueError(
             f"insufficient usable rows: need {checked_size}, found {len(usable)}"
@@ -313,6 +328,138 @@ def select_eligible_assays(
             f"found {len(eligible_ids)}"
         )
     return tuple(eligible_ids[:checked_assay_count]), eligible_ids[checked_assay_count]
+
+
+class _FrozenManifestModel(BaseModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        allow_inf_nan=False,
+    )
+
+
+class ManifestSource(_FrozenManifestModel):
+    """Immutable URL and content digest for one source artifact."""
+
+    url: str = Field(min_length=1, strict=True)
+    sha256: Sha256Hex
+
+
+class ManifestSources(_FrozenManifestModel):
+    """The three source artifacts required by a ProteinGym data manifest."""
+
+    substitutions: ManifestSource
+    scores: ManifestSource
+    metadata: ManifestSource
+
+
+class SelectedAssayManifest(_FrozenManifestModel):
+    """Immutable selected-assay counts and ordered working-set hashes."""
+
+    dms_id: str = Field(min_length=1, strict=True)
+    usable_count: int = Field(gt=0, strict=True)
+    sequence_length: int = Field(gt=0, strict=True)
+    row_hashes: tuple[Sha256Hex, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_row_hash_order(self) -> Self:
+        """Require a unique SHA-ordered working set for this assay."""
+        if len(set(self.row_hashes)) != len(self.row_hashes):
+            raise ValueError("row_hashes must be unique within each selected assay")
+        if self.row_hashes != tuple(sorted(self.row_hashes)):
+            raise ValueError("row_hashes must be sorted in ascending hash order")
+        return self
+
+
+class DataManifest(_FrozenManifestModel):
+    """Immutable, outcome-free provenance for frozen ProteinGym working sets."""
+
+    schema_version: int = Field(ge=1, le=1, strict=True)
+    data_release: str = Field(min_length=1, strict=True)
+    teacher_column: str = Field(min_length=1, strict=True)
+    sources: ManifestSources
+    upstream_revision: str = Field(min_length=1, strict=True)
+    eligible_assay_ids: tuple[StrictStr, ...] = Field(min_length=2)
+    confirmatory_ids: tuple[StrictStr, ...] = Field(min_length=1)
+    development_id: str = Field(min_length=1, strict=True)
+    max_length: int = Field(
+        gt=0,
+        le=_MAX_PROTEINGYM_SEQUENCE_LENGTH,
+        strict=True,
+    )
+    working_size: int = Field(gt=0, strict=True)
+    selected_assays: tuple[SelectedAssayManifest, ...] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def validate_selection_and_working_sets(self) -> Self:
+        """Validate lexical assay selection and exact working-set coverage."""
+        eligible = self.eligible_assay_ids
+        if len(set(eligible)) != len(eligible) or eligible != tuple(sorted(eligible)):
+            raise ValueError("eligible_assay_ids must be unique and lexically sorted")
+
+        confirmatory_count = len(self.confirmatory_ids)
+        if len(eligible) <= confirmatory_count:
+            raise ValueError(
+                "eligible assay prefix must include confirmatory and development IDs"
+            )
+        if (
+            self.confirmatory_ids != eligible[:confirmatory_count]
+            or self.development_id != eligible[confirmatory_count]
+        ):
+            raise ValueError(
+                "confirmatory_ids and development_id must match the "
+                "eligible assay prefix"
+            )
+
+        expected_selected_ids = (*self.confirmatory_ids, self.development_id)
+        actual_selected_ids = tuple(record.dms_id for record in self.selected_assays)
+        if actual_selected_ids != expected_selected_ids:
+            raise ValueError(
+                "selected_assays coverage and order must match "
+                "confirmatory plus dev IDs"
+            )
+
+        all_hashes: list[str] = []
+        for record in self.selected_assays:
+            if record.usable_count < self.working_size:
+                raise ValueError(
+                    f"usable_count for {record.dms_id} must be at least working_size"
+                )
+            if record.sequence_length > self.max_length:
+                raise ValueError(
+                    f"sequence_length for {record.dms_id} exceeds max_length"
+                )
+            if len(record.row_hashes) != self.working_size:
+                raise ValueError(
+                    f"row_hash count for {record.dms_id} must equal working_size"
+                )
+            all_hashes.extend(record.row_hashes)
+        if len(set(all_hashes)) != len(all_hashes):
+            raise ValueError("row_hashes must be unique across selected assays")
+        return self
+
+
+def write_data_manifest(path: Path | str, manifest: DataManifest) -> None:
+    """Atomically serialize a validated data manifest in canonical JSON form."""
+    if not isinstance(manifest, DataManifest):
+        raise TypeError("manifest must be a DataManifest")
+    atomic_write_json(path, manifest.model_dump(mode="json"))
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def load_data_manifest(path: Path | str) -> DataManifest:
+    """Load and strictly validate a data manifest JSON artifact."""
+    with Path(path).open(encoding="utf-8") as source:
+        payload = json.load(source, object_pairs_hook=_unique_json_object)
+    return DataManifest.model_validate(payload)
 
 
 @dataclass(frozen=True, slots=True)
