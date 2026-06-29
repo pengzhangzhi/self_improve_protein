@@ -211,7 +211,10 @@ def embed_sequences_with_model(
             key: value.to(checked_device) for key, value in encoded.items()
         }
         attention = model_inputs["attention_mask"]
-        with torch.inference_mode():
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type=checked_device.type, enabled=False),
+        ):
             output = model(**model_inputs, return_dict=True)
             hidden = getattr(output, "last_hidden_state", None)
             if not isinstance(hidden, torch.Tensor):

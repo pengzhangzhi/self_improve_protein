@@ -101,6 +101,13 @@ class FakeModel:
         return SimpleNamespace(last_hidden_state=hidden)
 
 
+class AutocastCheckingFakeModel(FakeModel):
+    def __call__(self, **kwargs: Any) -> SimpleNamespace:
+        device_type = kwargs["input_ids"].device.type
+        assert not torch.is_autocast_enabled(device_type)
+        return super().__call__(**kwargs)
+
+
 def test_mean_pool_excludes_bos_eos_and_padding() -> None:
     hidden = torch.tensor([[[100.0], [1.0], [3.0], [200.0], [300.0]]])
     attention = torch.tensor([[1, 1, 1, 1, 0]])
@@ -263,6 +270,23 @@ def test_batch_embedding_locks_tokenizer_and_model_call_contract() -> None:
     assert set(model.calls[0]) == {"input_ids", "attention_mask", "return_dict"}
     assert model.calls[0]["return_dict"] is True
     assert "special_tokens_mask" not in model.calls[0]
+
+
+def test_batch_embedding_disables_ambient_device_autocast() -> None:
+    model = AutocastCheckingFakeModel()
+
+    with torch.autocast("cpu", enabled=True):
+        assert torch.is_autocast_enabled("cpu")
+        actual = embed_sequences_with_model(
+            ("AC",),
+            tokenizer=FakeTokenizer(),
+            model=model,
+            batch_size=1,
+            device="cpu",
+        )
+
+    assert actual.dtype == np.float32
+    assert model.eval_calls == 1
 
 
 @pytest.mark.parametrize("batch_size", [0, -1, True, 1.5])
