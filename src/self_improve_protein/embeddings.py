@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, Self, cast
 
@@ -235,30 +237,49 @@ def embed_sequences_with_model(
     return np.ascontiguousarray(result)
 
 
-def _load_hf_components() -> tuple[Any, Any]:
-    """Load the exact frozen Hugging Face artifacts only on the real path."""
+def _validate_float32_model_state(model: Any) -> None:
+    """Reject floating model state that would change embedding cache bytes."""
+    for state_kind, values in (
+        ("parameter", model.named_parameters()),
+        ("buffer", model.named_buffers()),
+    ):
+        for name, value in values:
+            if not isinstance(name, str) or not isinstance(value, torch.Tensor):
+                raise TypeError(f"model {state_kind} entries must be named tensors")
+            if value.is_floating_point() and value.dtype != torch.float32:
+                raise ValueError(
+                    f"model {state_kind} {name!r} must have dtype float32"
+                )
+
+
+def _load_hf_components(model_id: str, model_revision: str) -> tuple[Any, Any]:
+    """Load one explicit revision in float32 only on the real command path."""
     from transformers import AutoModel, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call]
-        DEFAULT_MODEL_ID,
-        revision=DEFAULT_MODEL_REVISION,
+        model_id,
+        revision=model_revision,
     )
     model = AutoModel.from_pretrained(
-        DEFAULT_MODEL_ID,
-        revision=DEFAULT_MODEL_REVISION,
+        model_id,
+        revision=model_revision,
         add_pooling_layer=False,
+        dtype=torch.float32,
     )
+    _validate_float32_model_state(model)
     return tokenizer, model
 
 
 def embed_sequences(
     sequences: Sequence[str],
     *,
+    model_id: str,
+    model_revision: str,
     batch_size: int,
     device: str | torch.device,
 ) -> np.ndarray:
-    """Embed sequences with the exact revision-pinned ESM-2 representation."""
-    tokenizer, model = _load_hf_components()
+    """Embed sequences with one explicit revision-pinned representation."""
+    tokenizer, model = _load_hf_components(model_id, model_revision)
     return embed_sequences_with_model(
         sequences,
         tokenizer=tokenizer,
@@ -344,6 +365,49 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _remove_cache_pair(npy_path: Path, metadata_path: Path) -> None:
+    """Remove cache payload files and durably record their absence."""
+    directories: set[Path] = set()
+    for path in (npy_path, metadata_path):
+        path.unlink(missing_ok=True)
+        directories.add(path.parent)
+    for directory in directories:
+        if directory.exists():
+            _fsync_directory(directory)
+
+
+def _best_effort_remove_cache_pair(npy_path: Path, metadata_path: Path) -> None:
+    """Try every cleanup step without masking the originating write error."""
+    directories: set[Path] = set()
+    for path in (npy_path, metadata_path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
+        directories.add(path.parent)
+    for directory in directories:
+        try:
+            if directory.exists():
+                _fsync_directory(directory)
+        except OSError:
+            continue
+
+
+@contextmanager
+def _exclusive_cache_lock(metadata_path: Path) -> Iterator[None]:
+    """Serialize cache inspection and writes across cluster processes."""
+    lock_path = metadata_path.with_name(f".{metadata_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        os.fsync(lock_file.fileno())
+        _fsync_directory(lock_path.parent)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _atomic_write_npy(path: Path, embeddings: np.ndarray) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -380,7 +444,7 @@ def write_embedding_cache(
     model_revision: str,
     sources: EmbeddingCacheSources,
 ) -> EmbeddingCacheMetadata:
-    """Atomically write an array, then its canonical validating metadata."""
+    """Lock-free low-level write for prevalidated data; prefer get-or-create."""
     array_destination = Path(npy_path)
     metadata_destination = Path(metadata_path)
     if array_destination == metadata_destination:
@@ -397,20 +461,24 @@ def write_embedding_cache(
         row_count=len(hashes),
     )
     npy_digest = _atomic_write_npy(array_destination, checked_embeddings)
-    metadata = EmbeddingCacheMetadata(
-        schema_version=1,
-        dms_id=dms_id,
-        row_hash_digest=row_digest,
-        row_count=len(hashes),
-        model_id=model_id,
-        model_revision=model_revision,
-        pooling=POOLING_DEFINITION,
-        shape=cast(tuple[int, int], checked_embeddings.shape),
-        dtype="float32",
-        sources=sources,
-        npy_sha256=npy_digest,
-    )
-    atomic_write_json(metadata_destination, metadata.model_dump(mode="json"))
+    try:
+        metadata = EmbeddingCacheMetadata(
+            schema_version=1,
+            dms_id=dms_id,
+            row_hash_digest=row_digest,
+            row_count=len(hashes),
+            model_id=model_id,
+            model_revision=model_revision,
+            pooling=POOLING_DEFINITION,
+            shape=cast(tuple[int, int], checked_embeddings.shape),
+            dtype="float32",
+            sources=sources,
+            npy_sha256=npy_digest,
+        )
+        atomic_write_json(metadata_destination, metadata.model_dump(mode="json"))
+    except Exception:
+        _best_effort_remove_cache_pair(array_destination, metadata_destination)
+        raise
     return metadata
 
 
@@ -516,12 +584,65 @@ def get_or_create_embedding_cache(
     model_revision: str,
     sources: EmbeddingCacheSources,
     expected_embedding_dim: int,
-    compute: Callable[[], np.ndarray],
+    sequences: Sequence[str],
+    batch_size: int,
+    device: str | torch.device,
 ) -> np.ndarray:
-    """Reuse a fully valid cache, or compute exactly once when both files are absent."""
+    """Create one identity-coupled cache under a cross-process writer lock."""
     array_path = Path(npy_path)
     json_path = Path(metadata_path)
-    if array_path.exists() or json_path.exists():
+    ordered_sequences = _validate_sequences(sequences)
+    checked_batch_size = _validate_batch_size(batch_size)
+    checked_dim = _validate_expected_embedding_dim(expected_embedding_dim)
+    hashes, _ = _validate_cache_identity(
+        dms_id,
+        row_hashes,
+        model_id,
+        model_revision,
+        sources,
+    )
+    if len(ordered_sequences) != len(hashes):
+        raise ValueError("sequence count must match ordered row-hash count")
+
+    with _exclusive_cache_lock(json_path):
+        array_exists = array_path.exists()
+        metadata_exists = json_path.exists()
+        if array_exists and metadata_exists:
+            return load_embedding_cache(
+                array_path,
+                json_path,
+                dms_id=dms_id,
+                row_hashes=hashes,
+                model_id=model_id,
+                model_revision=model_revision,
+                sources=sources,
+                expected_embedding_dim=checked_dim,
+            )
+        if array_exists != metadata_exists:
+            _remove_cache_pair(array_path, json_path)
+
+        embeddings = embed_sequences(
+            ordered_sequences,
+            model_id=model_id,
+            model_revision=model_revision,
+            batch_size=checked_batch_size,
+            device=device,
+        )
+        checked_embeddings = _validate_embedding_array(
+            embeddings,
+            row_count=len(hashes),
+            embedding_dim=checked_dim,
+        )
+        write_embedding_cache(
+            array_path,
+            json_path,
+            checked_embeddings,
+            dms_id=dms_id,
+            row_hashes=hashes,
+            model_id=model_id,
+            model_revision=model_revision,
+            sources=sources,
+        )
         return load_embedding_cache(
             array_path,
             json_path,
@@ -530,28 +651,5 @@ def get_or_create_embedding_cache(
             model_id=model_id,
             model_revision=model_revision,
             sources=sources,
-            expected_embedding_dim=expected_embedding_dim,
+            expected_embedding_dim=checked_dim,
         )
-    if not callable(compute):
-        raise TypeError("compute must be callable")
-    embeddings = compute()
-    write_embedding_cache(
-        array_path,
-        json_path,
-        embeddings,
-        dms_id=dms_id,
-        row_hashes=row_hashes,
-        model_id=model_id,
-        model_revision=model_revision,
-        sources=sources,
-    )
-    return load_embedding_cache(
-        array_path,
-        json_path,
-        dms_id=dms_id,
-        row_hashes=row_hashes,
-        model_id=model_id,
-        model_revision=model_revision,
-        sources=sources,
-        expected_embedding_dim=expected_embedding_dim,
-    )

@@ -1,9 +1,14 @@
 import hashlib
 import json
+import multiprocessing
+import os
 import subprocess
 import sys
+import threading
+import time
 import types
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -54,6 +59,44 @@ def _cache_kwargs(row_hashes: Sequence[str]) -> dict[str, object]:
     }
 
 
+def _spawn_cache_writer(
+    npy_path_value: str,
+    json_path_value: str,
+    counter_path_value: str,
+    row_hashes: tuple[str, ...],
+    start_event: Any,
+    result_queue: Any,
+) -> None:
+    npy_path = Path(npy_path_value)
+    json_path = Path(json_path_value)
+    counter_path = Path(counter_path_value)
+    expected = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+
+    def compute(*args: object, **kwargs: object) -> np.ndarray:
+        with counter_path.open("ab") as counter:
+            counter.write(f"{os.getpid()}\n".encode())
+            counter.flush()
+            os.fsync(counter.fileno())
+        time.sleep(0.1)
+        return expected.copy()
+
+    embedding_module.embed_sequences = compute
+    start_event.wait()
+    try:
+        result = get_or_create_embedding_cache(
+            npy_path,
+            json_path,
+            sequences=("A", "C"),
+            expected_embedding_dim=2,
+            batch_size=2,
+            device="cpu",
+            **_cache_kwargs(row_hashes),
+        )
+        result_queue.put(("ok", result.tobytes()))
+    except Exception as error:
+        result_queue.put(("error", repr(error)))
+
+
 class FakeTokenizer:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
@@ -100,12 +143,45 @@ class FakeModel:
         hidden = kwargs["input_ids"].to(torch.float32).unsqueeze(-1)
         return SimpleNamespace(last_hidden_state=hidden)
 
+    def named_parameters(self) -> Sequence[tuple[str, torch.Tensor]]:
+        return (("weight", torch.ones(1, dtype=torch.float32)),)
+
+    def named_buffers(self) -> Sequence[tuple[str, torch.Tensor]]:
+        return (
+            ("float_buffer", torch.zeros(1, dtype=torch.float32)),
+            ("integer_buffer", torch.zeros(1, dtype=torch.int64)),
+        )
+
 
 class AutocastCheckingFakeModel(FakeModel):
     def __call__(self, **kwargs: Any) -> SimpleNamespace:
         device_type = kwargs["input_ids"].device.type
         assert not torch.is_autocast_enabled(device_type)
         return super().__call__(**kwargs)
+
+
+def _install_fake_transformers(
+    monkeypatch: pytest.MonkeyPatch,
+    tokenizer: FakeTokenizer,
+    model: FakeModel,
+    calls: dict[str, tuple[tuple[object, ...], dict[str, object]]],
+) -> None:
+    class AutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *args: object, **kwargs: object) -> FakeTokenizer:
+            calls["tokenizer"] = (args, kwargs)
+            return tokenizer
+
+    class AutoModel:
+        @classmethod
+        def from_pretrained(cls, *args: object, **kwargs: object) -> FakeModel:
+            calls["model"] = (args, kwargs)
+            return model
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = AutoTokenizer  # type: ignore[attr-defined]
+    fake_transformers.AutoModel = AutoModel  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
 
 def test_mean_pool_excludes_bos_eos_and_padding() -> None:
@@ -322,24 +398,19 @@ def test_real_embedding_path_uses_exact_hf_revision_and_no_pooler(
     model = FakeModel()
     calls: dict[str, tuple[tuple[object, ...], dict[str, object]]] = {}
 
-    class AutoTokenizer:
-        @classmethod
-        def from_pretrained(cls, *args: object, **kwargs: object) -> FakeTokenizer:
-            calls["tokenizer"] = (args, kwargs)
-            return tokenizer
-
-    class AutoModel:
-        @classmethod
-        def from_pretrained(cls, *args: object, **kwargs: object) -> FakeModel:
-            calls["model"] = (args, kwargs)
-            return model
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoTokenizer = AutoTokenizer  # type: ignore[attr-defined]
-    fake_transformers.AutoModel = AutoModel  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    actual = embed_sequences(("AC",), batch_size=1, device="cpu")
+    _install_fake_transformers(monkeypatch, tokenizer, model, calls)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        actual = embed_sequences(
+            ("AC",),
+            model_id=DEFAULT_MODEL_ID,
+            model_revision=DEFAULT_MODEL_REVISION,
+            batch_size=1,
+            device="cpu",
+        )
+    finally:
+        torch.set_default_dtype(previous_dtype)
 
     assert actual.dtype == np.float32
     assert calls == {
@@ -352,9 +423,41 @@ def test_real_embedding_path_uses_exact_hf_revision_and_no_pooler(
             {
                 "revision": DEFAULT_MODEL_REVISION,
                 "add_pooling_layer": False,
+                "dtype": torch.float32,
             },
         ),
     }
+
+
+@pytest.mark.parametrize("bad_tensor", ["parameter", "buffer"])
+def test_exact_hf_loader_rejects_non_float32_model_state(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_tensor: str,
+) -> None:
+    class BadDtypeModel(FakeModel):
+        def named_parameters(self) -> Sequence[tuple[str, torch.Tensor]]:
+            if bad_tensor == "parameter":
+                return (("bad_weight", torch.ones(1, dtype=torch.float64)),)
+            return super().named_parameters()
+
+        def named_buffers(self) -> Sequence[tuple[str, torch.Tensor]]:
+            if bad_tensor == "buffer":
+                return (("bad_buffer", torch.ones(1, dtype=torch.float64)),)
+            return super().named_buffers()
+
+    calls: dict[str, tuple[tuple[object, ...], dict[str, object]]] = {}
+    _install_fake_transformers(
+        monkeypatch,
+        FakeTokenizer(),
+        BadDtypeModel(),
+        calls,
+    )
+
+    with pytest.raises(ValueError, match=rf"{bad_tensor}.*float32"):
+        embedding_module._load_hf_components(
+            DEFAULT_MODEL_ID,
+            DEFAULT_MODEL_REVISION,
+        )
 
 
 def test_embedding_module_import_does_not_import_transformers() -> None:
@@ -429,7 +532,10 @@ def test_embedding_cache_roundtrip_and_bytes_are_deterministic(tmp_path: Path) -
     assert first.row_hash_digest == ordered_row_hash_digest(row_hashes)
 
 
-def test_embedding_cache_hit_does_not_recompute(tmp_path: Path) -> None:
+def test_embedding_cache_hit_does_not_recompute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     row_hashes = (_row_hash("a"), _row_hash("b"))
     npy_path = tmp_path / "cache.npy"
     json_path = tmp_path / "cache.json"
@@ -441,40 +547,352 @@ def test_embedding_cache_hit_does_not_recompute(tmp_path: Path) -> None:
         **_cache_kwargs(row_hashes),
     )
 
-    def forbidden() -> np.ndarray:
+    def forbidden(*args: object, **kwargs: object) -> np.ndarray:
         raise AssertionError("cache hit recomputed embeddings")
+
+    monkeypatch.setattr(embedding_module, "embed_sequences", forbidden)
 
     actual = get_or_create_embedding_cache(
         npy_path,
         json_path,
+        sequences=("A", "C"),
         expected_embedding_dim=1,
-        compute=forbidden,
+        batch_size=2,
+        device="cpu",
         **_cache_kwargs(row_hashes),
     )
 
     np.testing.assert_array_equal(actual, expected)
 
 
-def test_embedding_cache_miss_computes_once_and_validates(tmp_path: Path) -> None:
+def test_embedding_cache_miss_computes_once_and_validates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     row_hashes = (_row_hash("a"), _row_hash("b"))
     calls = 0
     expected = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
 
-    def compute() -> np.ndarray:
+    def compute(*args: object, **kwargs: object) -> np.ndarray:
         nonlocal calls
         calls += 1
         return expected.copy()
 
+    monkeypatch.setattr(embedding_module, "embed_sequences", compute)
+
     actual = get_or_create_embedding_cache(
         tmp_path / "cache.npy",
         tmp_path / "cache.json",
+        sequences=("A", "C"),
         expected_embedding_dim=2,
-        compute=compute,
+        batch_size=2,
+        device="cpu",
         **_cache_kwargs(row_hashes),
     )
 
     assert calls == 1
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_cache_miss_couples_explicit_model_identity_to_loader_and_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_id = "test/non-default-model"
+    model_revision = "a" * 40
+    row_hashes = (_row_hash("a"), _row_hash("b"))
+    calls: dict[str, tuple[tuple[object, ...], dict[str, object]]] = {}
+    _install_fake_transformers(
+        monkeypatch,
+        FakeTokenizer(),
+        FakeModel(),
+        calls,
+    )
+    npy_path = tmp_path / "cache.npy"
+    json_path = tmp_path / "cache.json"
+
+    actual = get_or_create_embedding_cache(
+        npy_path,
+        json_path,
+        sequences=("A", "C"),
+        dms_id="TINY",
+        row_hashes=row_hashes,
+        model_id=model_id,
+        model_revision=model_revision,
+        sources=_sources(),
+        expected_embedding_dim=1,
+        batch_size=2,
+        device="cpu",
+    )
+    metadata = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert actual.dtype == np.float32
+    assert calls["tokenizer"] == ((model_id,), {"revision": model_revision})
+    assert calls["model"] == (
+        (model_id,),
+        {
+            "revision": model_revision,
+            "add_pooling_layer": False,
+            "dtype": torch.float32,
+        },
+    )
+    assert metadata["model_id"] == model_id
+    assert metadata["model_revision"] == model_revision
+
+
+def test_bad_embedding_width_fails_before_write_and_retry_can_succeed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row_hashes = (_row_hash("a"), _row_hash("b"))
+    npy_path = tmp_path / "cache.npy"
+    json_path = tmp_path / "cache.json"
+
+    def wrong_width(*args: object, **kwargs: object) -> np.ndarray:
+        return np.ones((2, 479), dtype=np.float32)
+
+    monkeypatch.setattr(embedding_module, "embed_sequences", wrong_width)
+    with pytest.raises(ValueError, match="embedding width"):
+        get_or_create_embedding_cache(
+            npy_path,
+            json_path,
+            sequences=("A", "C"),
+            expected_embedding_dim=480,
+            batch_size=2,
+            device="cpu",
+            **_cache_kwargs(row_hashes),
+        )
+
+    assert not npy_path.exists()
+    assert not json_path.exists()
+
+    expected = np.ones((2, 480), dtype=np.float32)
+
+    def correct_width(*args: object, **kwargs: object) -> np.ndarray:
+        return expected.copy()
+
+    monkeypatch.setattr(embedding_module, "embed_sequences", correct_width)
+    actual = get_or_create_embedding_cache(
+        npy_path,
+        json_path,
+        sequences=("A", "C"),
+        expected_embedding_dim=480,
+        batch_size=2,
+        device="cpu",
+        **_cache_kwargs(row_hashes),
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("orphan", ["npy", "json"])
+def test_cache_retry_cleans_exactly_one_file_orphan_under_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    orphan: str,
+) -> None:
+    row_hashes = (_row_hash("a"), _row_hash("b"))
+    npy_path = tmp_path / "cache.npy"
+    json_path = tmp_path / "cache.json"
+    if orphan == "npy":
+        np.save(npy_path, np.zeros((2, 2), dtype=np.float32), allow_pickle=False)
+    else:
+        json_path.write_text("{}\n", encoding="utf-8")
+    expected = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    calls = 0
+
+    def compute(*args: object, **kwargs: object) -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        return expected.copy()
+
+    monkeypatch.setattr(embedding_module, "embed_sequences", compute)
+    actual = get_or_create_embedding_cache(
+        npy_path,
+        json_path,
+        sequences=("A", "C"),
+        expected_embedding_dim=2,
+        batch_size=2,
+        device="cpu",
+        **_cache_kwargs(row_hashes),
+    )
+
+    assert calls == 1
+    np.testing.assert_array_equal(actual, expected)
+    assert npy_path.is_file()
+    assert json_path.is_file()
+
+
+def test_metadata_failure_cleans_pair_and_high_level_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row_hashes = (_row_hash("a"), _row_hash("b"))
+    npy_path = tmp_path / "cache.npy"
+    json_path = tmp_path / "cache.json"
+    expected = np.ones((2, 2), dtype=np.float32)
+
+    def compute(*args: object, **kwargs: object) -> np.ndarray:
+        return expected.copy()
+
+    original_write_json = embedding_module.atomic_write_json
+    metadata_attempts = 0
+
+    def fail_once(path: object, payload: object) -> None:
+        nonlocal metadata_attempts
+        metadata_attempts += 1
+        if metadata_attempts == 1:
+            raise OSError("simulated metadata crash")
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(embedding_module, "embed_sequences", compute)
+    monkeypatch.setattr(embedding_module, "atomic_write_json", fail_once)
+    with pytest.raises(OSError, match="metadata crash"):
+        get_or_create_embedding_cache(
+            npy_path,
+            json_path,
+            sequences=("A", "C"),
+            expected_embedding_dim=2,
+            batch_size=2,
+            device="cpu",
+            **_cache_kwargs(row_hashes),
+        )
+
+    assert not npy_path.exists()
+    assert not json_path.exists()
+
+    actual = get_or_create_embedding_cache(
+        npy_path,
+        json_path,
+        sequences=("A", "C"),
+        expected_embedding_dim=2,
+        batch_size=2,
+        device="cpu",
+        **_cache_kwargs(row_hashes),
+    )
+
+    assert metadata_attempts == 2
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_concurrent_cache_writers_compute_once_and_return_same_valid_array(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row_hashes = (_row_hash("a"), _row_hash("b"))
+    npy_path = tmp_path / "cache.npy"
+    json_path = tmp_path / "cache.json"
+    expected = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    counter_lock = threading.Lock()
+    start_barrier = threading.Barrier(4)
+    calls = 0
+
+    def compute(*args: object, **kwargs: object) -> np.ndarray:
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+        time.sleep(0.05)
+        return expected.copy()
+
+    def create_or_load() -> np.ndarray:
+        start_barrier.wait()
+        return get_or_create_embedding_cache(
+            npy_path,
+            json_path,
+            sequences=("A", "C"),
+            expected_embedding_dim=2,
+            batch_size=2,
+            device="cpu",
+            **_cache_kwargs(row_hashes),
+        )
+
+    monkeypatch.setattr(embedding_module, "embed_sequences", compute)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = tuple(executor.map(lambda _: create_or_load(), range(4)))
+
+    assert calls == 1
+    for result in results:
+        np.testing.assert_array_equal(result, expected)
+
+
+def test_cross_process_cache_writers_compute_once_and_return_same_valid_array(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    row_hashes = (_row_hash("a"), _row_hash("b"))
+    npy_path = tmp_path / "cache.npy"
+    json_path = tmp_path / "cache.json"
+    counter_path = tmp_path / "compute-count.log"
+    expected = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    start_event = context.Event()
+    result_queue = context.Queue()
+    process_args = (
+        str(npy_path),
+        str(json_path),
+        str(counter_path),
+        row_hashes,
+        start_event,
+        result_queue,
+    )
+    processes = [
+        context.Process(target=_spawn_cache_writer, args=process_args)
+        for _ in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        start_event.set()
+        for process in processes:
+            process.join(timeout=15)
+        assert all(not process.is_alive() for process in processes)
+        assert all(process.exitcode == 0 for process in processes)
+        results = [result_queue.get(timeout=2) for _ in processes]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+
+    assert len(counter_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert results == [("ok", expected.tobytes())] * len(processes)
+
+
+def test_both_present_corruption_fails_closed_without_recompute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row_hashes = (_row_hash("a"), _row_hash("b"))
+    npy_path = tmp_path / "cache.npy"
+    json_path = tmp_path / "cache.json"
+    write_embedding_cache(
+        npy_path,
+        json_path,
+        np.ones((2, 2), dtype=np.float32),
+        **_cache_kwargs(row_hashes),
+    )
+    npy_path.write_bytes(b"corrupt-but-present")
+    corrupt_bytes = npy_path.read_bytes()
+    metadata_bytes = json_path.read_bytes()
+
+    def forbidden(*args: object, **kwargs: object) -> np.ndarray:
+        raise AssertionError("corrupt complete pair must not be recomputed")
+
+    monkeypatch.setattr(embedding_module, "embed_sequences", forbidden)
+    with pytest.raises(ValueError, match="checksum"):
+        get_or_create_embedding_cache(
+            npy_path,
+            json_path,
+            sequences=("A", "C"),
+            expected_embedding_dim=2,
+            batch_size=2,
+            device="cpu",
+            **_cache_kwargs(row_hashes),
+        )
+
+    assert npy_path.read_bytes() == corrupt_bytes
+    assert json_path.read_bytes() == metadata_bytes
 
 
 @pytest.mark.parametrize(
@@ -667,7 +1085,7 @@ def test_embedding_cache_atomic_array_failure_cleans_temp_files(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_embedding_cache_metadata_failure_leaves_only_rejected_incomplete_pair(
+def test_low_level_cache_metadata_failure_removes_new_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -687,16 +1105,9 @@ def test_embedding_cache_metadata_failure_leaves_only_rejected_incomplete_pair(
             **_cache_kwargs(row_hashes),
         )
 
-    assert npy_path.is_file()
+    assert not npy_path.exists()
     assert not json_path.exists()
     assert not list(tmp_path.glob("*.tmp"))
-    with pytest.raises(ValueError, match="incomplete"):
-        load_embedding_cache(
-            npy_path,
-            json_path,
-            expected_embedding_dim=2,
-            **_cache_kwargs(row_hashes),
-        )
 
 
 def test_embedding_cache_metadata_is_strict_deeply_immutable_and_extra_forbid() -> None:

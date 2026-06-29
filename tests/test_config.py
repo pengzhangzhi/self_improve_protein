@@ -71,6 +71,24 @@ def test_v0_protocol_has_all_locked_values() -> None:
     assert protocol.max_length == 512
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model", "other/model"),
+        ("model_revision", "a" * 40),
+    ],
+)
+def test_v0_protocol_rejects_any_other_embedding_model_identity(
+    field: str,
+    value: str,
+) -> None:
+    data = _protocol_data()
+    data[field] = value
+
+    with pytest.raises(ValidationError, match=field):
+        Protocol.model_validate(data)
+
+
 def test_v0_protocol_has_official_sources_and_preprocessing() -> None:
     protocol = load_protocol(CONFIG_PATH)
 

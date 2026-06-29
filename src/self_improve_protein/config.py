@@ -83,8 +83,8 @@ class Protocol(BaseModel):
     zero_shot_scores_sha256: Sha256Hex
     metadata_sha256: Sha256Hex
     teacher_column: str = Field(min_length=1)
-    model: str = Field(min_length=1)
-    model_revision: GitCommit
+    model: Literal["facebook/esm2_t12_35M_UR50D"]
+    model_revision: Literal["6fbf070e65b0b7291e7bbcd451118c216cff79d8"]
 
     working_size: int = Field(gt=0, strict=True)
     n_labeled: int = Field(gt=0, strict=True)
