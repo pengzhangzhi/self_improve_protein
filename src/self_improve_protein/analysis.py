@@ -357,7 +357,7 @@ def _paired_deltas(
 
 
 def exact_sign_flip_pvalue(assay_deltas: ArrayLike) -> float:
-    """Enumerate the exact two-sided sign-flip null over assay means."""
+    """Enumerate the exact two-sided sign-flip null over binary64 inputs."""
     try:
         deltas = np.asarray(assay_deltas, dtype=np.float64)
     except (TypeError, ValueError) as error:
@@ -368,12 +368,21 @@ def exact_sign_flip_pvalue(assay_deltas: ArrayLike) -> float:
         raise ValueError("assay_deltas must be finite")
     assay_count = deltas.size
     total_assignments = 1 << assay_count
-    observed = abs(float(np.mean(deltas)))
+    ratios = [float(delta).as_integer_ratio() for delta in deltas]
+    common_denominator = max(denominator for _, denominator in ratios)
+    integer_deltas = tuple(
+        numerator * (common_denominator // denominator)
+        for numerator, denominator in ratios
+    )
+    observed = abs(sum(integer_deltas))
     extreme_count = 0
-    bit_positions = np.arange(assay_count, dtype=np.int64)
     for mask in range(total_assignments):
-        signs = np.where((mask >> bit_positions) & 1, 1.0, -1.0)
-        permuted = abs(float(np.mean(signs * deltas)))
+        permuted = abs(
+            sum(
+                delta if (mask >> index) & 1 else -delta
+                for index, delta in enumerate(integer_deltas)
+            )
+        )
         if permuted >= observed:
             extreme_count += 1
     return extreme_count / total_assignments
@@ -609,6 +618,16 @@ def _validate_v0_verdict_grid(results: pd.DataFrame) -> None:
     reference_keys = method_keys["ours"]
     if any(keys != reference_keys for keys in method_keys.values()):
         raise ValueError("v0 confirmatory methods must have identical paired tasks")
+
+    locked_seeds = {0, 1, 2, 3, 4}
+    for _, group in confirmatory.groupby(["method", "assay_id"], sort=False):
+        seed_values = tuple(group["seed"])
+        seeds_are_integers = all(
+            isinstance(seed, Integral) and not isinstance(seed, (bool, np.bool_))
+            for seed in seed_values
+        )
+        if not seeds_are_integers or set(seed_values) != locked_seeds:
+            raise ValueError("v0 verdict seeds must be exactly {0, 1, 2, 3, 4}")
 
     assay_counts = (
         confirmatory.loc[confirmatory["method"] == "ours"]

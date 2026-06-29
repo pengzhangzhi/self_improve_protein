@@ -185,6 +185,8 @@ def test_exact_sign_flip_enumerates_all_2_to_the_a_assignments() -> None:
     assert exact_sign_flip_pvalue(ASSAY_DELTAS) == pytest.approx(34 / 256)
     assert exact_sign_flip_pvalue(np.zeros(8)) == 1.0
     assert exact_sign_flip_pvalue(np.array([1e-16, 1e-16])) == 0.5
+    cancellation_ties = np.array([6.2, 8.9, -6.2, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert exact_sign_flip_pvalue(cancellation_ties) == 192 / 256
 
 
 def test_hierarchical_bootstrap_is_deterministic_and_resamples_both_levels() -> None:
@@ -325,6 +327,14 @@ def test_v0_verdict_requires_exactly_40_tasks_and_8_assays(assay_count: int) -> 
         table = pd.concat([table, extra], ignore_index=True)
 
     with pytest.raises(ValueError, match=r"exactly 40.*8 assays"):
+        v0_analysis_verdict(table)
+
+
+def test_v0_verdict_rejects_nonlocked_seed_values() -> None:
+    table = _complete_results()
+    table["seed"] = table["seed"] + 10
+
+    with pytest.raises(ValueError, match=r"seeds.*0.*1.*2.*3.*4"):
         v0_analysis_verdict(table)
 
 
