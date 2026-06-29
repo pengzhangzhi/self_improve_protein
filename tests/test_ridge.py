@@ -75,6 +75,35 @@ def test_feature_transform_rejects_constant_labeled_matrix() -> None:
         fit_feature_transform(np.ones((4, 3), dtype=np.float64))
 
 
+def test_feature_transform_rejects_effectively_zero_scale_but_accepts_control() -> (
+    None
+):
+    tiny_delta = 1e-10
+    tiny_variation = np.array(
+        [
+            [1.0 - tiny_delta, 1.0 + tiny_delta],
+            [1.0 + tiny_delta, 1.0 - tiny_delta],
+        ],
+        dtype=np.float64,
+    )
+    control_delta = 1e-6
+    resolvable_variation = np.array(
+        [
+            [1.0 - control_delta, 1.0 + control_delta],
+            [1.0 + control_delta, 1.0 - control_delta],
+        ],
+        dtype=np.float64,
+    )
+
+    with pytest.raises(ValueError, match="effectively zero"):
+        fit_feature_transform(tiny_variation)
+    with pytest.raises(ValueError, match="effectively zero"):
+        FeatureTransform(mean=np.array([1.0, 1.0]), scale=tiny_delta)
+
+    transform = fit_feature_transform(resolvable_variation)
+    assert transform.scale == pytest.approx(control_delta)
+
+
 def test_feature_transform_rejects_wrong_width_rank_and_nonfinite_inputs() -> None:
     transform = fit_feature_transform(
         np.array([[0.0, 1.0], [2.0, 3.0]], dtype=np.float64)
@@ -155,6 +184,29 @@ def test_label_transform_rejects_zero_scale_invalid_ddof_and_bad_values() -> Non
         transform.mean = 3.0
 
 
+def test_label_transform_rejects_effectively_zero_scale_but_accepts_control() -> (
+    None
+):
+    tiny_delta = 1e-10
+    tiny_variation = np.array(
+        [1.0 - tiny_delta, 1.0 + tiny_delta],
+        dtype=np.float64,
+    )
+    control_delta = 1e-6
+    resolvable_variation = np.array(
+        [1.0 - control_delta, 1.0 + control_delta],
+        dtype=np.float64,
+    )
+
+    with pytest.raises(ValueError, match="effectively zero"):
+        fit_label_transform(tiny_variation)
+    with pytest.raises(ValueError, match="effectively zero"):
+        LabelTransform(mean=1.0, scale=tiny_delta)
+
+    transform = fit_label_transform(resolvable_variation)
+    assert transform.scale == pytest.approx(control_delta)
+
+
 def test_teacher_calibration_exactly_recovers_affine_teacher_mapping() -> None:
     z_l = np.array([-4.0, -1.0, 0.5, 3.0, 8.0], dtype=np.float64)
     y_l_std = 2.75 * z_l - 1.25
@@ -180,6 +232,38 @@ def test_constant_teacher_uses_zero_slope_and_label_mean_intercept() -> None:
         calibration.predict(np.array([-10.0, 0.0, 10.0])),
         y_l_std.mean(),
     )
+
+
+def test_teacher_calibration_recovers_affine_map_at_large_offset() -> None:
+    offset = 1e8
+    z_l = offset + np.linspace(-0.25, 0.25, 9, dtype=np.float64)
+    y_l_std = 2.75 * z_l - 1.25
+
+    calibration = fit_teacher_calibration(z_l, y_l_std)
+
+    assert np.ptp(z_l) < np.sqrt(np.finfo(np.float64).eps) * offset
+    assert calibration.slope == pytest.approx(2.75, abs=1e-13)
+    assert calibration.intercept == pytest.approx(-1.25, abs=1e-5)
+    np.testing.assert_allclose(
+        calibration.predict(z_l),
+        y_l_std,
+        atol=1e-12,
+        rtol=0.0,
+    )
+
+
+def test_near_constant_teacher_uses_intercept_only_calibration() -> None:
+    offset = 1e8
+    spacing = np.spacing(offset)
+    z_l = offset + np.array([-spacing, 0.0, spacing, 0.0])
+    y_l_std = np.array([-2.0, 0.0, 1.0, 5.0], dtype=np.float64)
+
+    calibration = fit_teacher_calibration(z_l, y_l_std)
+
+    assert np.ptp(z_l) > 0.0
+    assert calibration.slope == 0.0
+    assert calibration.intercept == pytest.approx(float(y_l_std.mean()))
+    np.testing.assert_allclose(calibration.predict(z_l), y_l_std.mean())
 
 
 def test_teacher_calibration_rejects_invalid_inputs_and_parameters() -> None:
@@ -301,6 +385,43 @@ def test_weighted_ridge_predictions_are_feature_scale_equivariant() -> None:
         atol=1e-13,
         rtol=1e-12,
     )
+
+
+def test_unregularized_fit_matches_lstsq_on_ill_conditioned_full_rank_design() -> (
+    None
+):
+    t = np.linspace(-1.0, 1.0, 8, dtype=np.float64)
+    x = np.column_stack((np.ones(8), 1.0 + 3e-8 * t))
+    theta_true = np.array([1.25, -0.75], dtype=np.float64)
+    y = x @ theta_true
+
+    theta = fit_weighted_ridge(x, y, ridge_lambda=0.0)
+    lstsq_theta = np.linalg.lstsq(x, y, rcond=None)[0]
+
+    assert 5e7 < np.linalg.cond(x) < 2e8
+    assert np.linalg.norm(lstsq_theta - theta_true) < 1e-7
+    np.testing.assert_allclose(theta, lstsq_theta, atol=1e-12, rtol=1e-12)
+    assert np.linalg.norm(theta - theta_true) < 1e-7
+
+
+@pytest.mark.parametrize("ridge_lambda", [0.0, 0.19])
+def test_weighted_ridge_is_invariant_to_common_positive_weight_rescaling(
+    ridge_lambda: float,
+) -> None:
+    rng = np.random.default_rng(193)
+    x = rng.normal(size=(9, 4)).astype(np.float64)
+    y = rng.normal(size=9).astype(np.float64)
+    weights = rng.uniform(0.2, 1.7, size=9).astype(np.float64)
+
+    theta = fit_weighted_ridge(x, y, ridge_lambda, sample_weight=weights)
+    rescaled_theta = fit_weighted_ridge(
+        x,
+        y,
+        ridge_lambda,
+        sample_weight=37.0 * weights,
+    )
+
+    np.testing.assert_allclose(rescaled_theta, theta, atol=1e-13, rtol=1e-12)
 
 
 def test_squared_loss_is_half_the_mean_squared_residual() -> None:

@@ -8,6 +8,9 @@ from numpy.typing import NDArray
 
 FloatArray: TypeAlias = NDArray[np.float64]
 
+_FLOAT64_EPSILON = float(np.finfo(np.float64).eps)
+_FLOAT64_SQRT_EPSILON = float(np.sqrt(_FLOAT64_EPSILON))
+
 
 def _as_float64_matrix(value: FloatArray, *, name: str) -> FloatArray:
     """Return *value* as a finite, non-empty float64 matrix."""
@@ -69,6 +72,11 @@ def _validated_ridge_lambda(ridge_lambda: float) -> float:
     return value
 
 
+def _variation_floor(reference_magnitude: float) -> float:
+    """Return ``sqrt(float64 eps) * max(1, magnitude)`` for ESM/fitness data."""
+    return _FLOAT64_SQRT_EPSILON * max(1.0, reference_magnitude)
+
+
 @dataclass(frozen=True)
 class FeatureTransform:
     """Labeled-only column centering with one global RMS scale."""
@@ -84,8 +92,9 @@ class FeatureTransform:
         )
         mean.setflags(write=False)
         scale = _finite_scalar(self.scale, name="scale")
-        if scale <= 0.0:
-            raise ValueError("scale must be strictly positive")
+        scale_floor = _variation_floor(float(np.max(np.abs(mean))))
+        if scale <= scale_floor:
+            raise ValueError("feature scale is effectively zero")
         object.__setattr__(self, "mean", mean)
         object.__setattr__(self, "scale", scale)
 
@@ -106,8 +115,11 @@ def fit_feature_transform(x_l: FloatArray) -> FeatureTransform:
     mean = np.asarray(matrix.mean(axis=0), dtype=np.float64)
     centered = matrix - mean
     scale = float(np.sqrt(np.mean(centered * centered)))
-    if not np.all(np.isfinite(mean)) or not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("feature scale must be finite and strictly positive")
+    if not np.all(np.isfinite(mean)) or not np.isfinite(scale):
+        raise ValueError("feature scale must be finite")
+    scale_floor = _variation_floor(float(np.max(np.abs(matrix))))
+    if scale <= scale_floor:
+        raise ValueError("feature scale is effectively zero")
     return FeatureTransform(mean=mean, scale=scale)
 
 
@@ -122,8 +134,8 @@ class LabelTransform:
     def __post_init__(self) -> None:
         mean = _finite_scalar(self.mean, name="mean")
         scale = _finite_scalar(self.scale, name="scale")
-        if scale <= 0.0:
-            raise ValueError("scale must be strictly positive")
+        if scale <= _variation_floor(abs(mean)):
+            raise ValueError("label scale is effectively zero")
         if type(self.ddof) is not int or self.ddof != 0:
             raise ValueError("ddof must be the integer 0")
         object.__setattr__(self, "mean", mean)
@@ -147,8 +159,11 @@ def fit_label_transform(y_l: FloatArray, *, ddof: int = 0) -> LabelTransform:
     vector = _as_float64_vector(y_l, name="y_l")
     mean = float(np.mean(vector))
     scale = float(np.std(vector, ddof=ddof))
-    if not np.isfinite(mean) or not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("label scale must be finite and strictly positive")
+    if not np.isfinite(mean) or not np.isfinite(scale):
+        raise ValueError("label scale must be finite")
+    scale_floor = _variation_floor(float(np.max(np.abs(vector))))
+    if scale <= scale_floor:
+        raise ValueError("label scale is effectively zero")
     return LabelTransform(mean=mean, scale=scale, ddof=ddof)
 
 
@@ -182,13 +197,23 @@ def fit_teacher_calibration(
     labels = _as_float64_vector(y_l_standardized, name="y_l_standardized")
     if teacher.shape[0] != labels.shape[0]:
         raise ValueError("z_l and y_l_standardized must have the same number of rows")
-    if np.all(teacher == teacher[0]):
-        return TeacherCalibration(slope=0.0, intercept=float(np.mean(labels)))
-    design = np.column_stack((teacher, np.ones_like(teacher)))
-    coefficients, _, _, _ = np.linalg.lstsq(design, labels, rcond=None)
+    teacher_mean = float(np.mean(teacher))
+    label_mean = float(np.mean(labels))
+    teacher_centered = teacher - teacher_mean
+    label_centered = labels - label_mean
+    teacher_rms = float(np.sqrt(np.mean(teacher_centered * teacher_centered)))
+    teacher_resolution = _FLOAT64_EPSILON * max(
+        1.0,
+        float(np.max(np.abs(teacher))),
+    )
+    # Epsilon, rather than sqrt(epsilon), preserves resolved spread at offsets.
+    if teacher_rms <= teacher_resolution:
+        return TeacherCalibration(slope=0.0, intercept=label_mean)
+    denominator = float(teacher_centered @ teacher_centered)
+    slope = float((teacher_centered @ label_centered) / denominator)
     return TeacherCalibration(
-        slope=float(coefficients[0]),
-        intercept=float(coefficients[1]),
+        slope=slope,
+        intercept=label_mean - slope * teacher_mean,
     )
 
 
@@ -213,11 +238,21 @@ def fit_weighted_ridge(
     if not np.isfinite(denominator):
         raise ValueError("sample_weight sum must be finite")
     if regularization == 0.0:
-        weighted_matrix = np.sqrt(weights)[:, None] * matrix
-        if not np.all(np.isfinite(weighted_matrix)):
-            raise ValueError("weighted ridge normal equations must be finite")
-        if np.linalg.matrix_rank(weighted_matrix) < matrix.shape[1]:
+        square_root_weights = np.sqrt(weights)
+        weighted_matrix = square_root_weights[:, None] * matrix
+        weighted_response = square_root_weights * response
+        if not np.all(np.isfinite(weighted_matrix)) or not np.all(
+            np.isfinite(weighted_response)
+        ):
+            raise ValueError("weighted least-squares system must be finite")
+        solution, _, rank, _ = np.linalg.lstsq(
+            weighted_matrix,
+            weighted_response,
+            rcond=None,
+        )
+        if rank != matrix.shape[1]:
             raise np.linalg.LinAlgError("weighted ridge normal matrix is singular")
+        return np.asarray(solution, dtype=np.float64)
     identity = np.eye(matrix.shape[1], dtype=np.float64)
     gram = (
         matrix.T @ (weights[:, None] * matrix)
