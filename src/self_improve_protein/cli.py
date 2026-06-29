@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import zipfile
 from collections.abc import Callable, Sequence
@@ -18,6 +19,7 @@ import numpy as np
 import pandas as pd  # type: ignore[import-untyped]
 import typer
 from numpy.typing import NDArray
+from typer import _click
 
 from self_improve_protein.analysis import (
     comparison_summary_table,
@@ -48,12 +50,14 @@ from self_improve_protein.embeddings import (
 )
 from self_improve_protein.experiment import (
     METHOD_NAMES,
+    NUMERICAL_POLICY,
     EvaluationLabels,
     FitInputs,
     canonical_evaluation_digest,
     canonical_fit_digest,
     canonical_protocol_digest,
     canonical_source_digest,
+    current_numerical_runtime_fingerprint,
     evaluate_task,
     fit_task,
     require_openblas_coretype,
@@ -72,6 +76,9 @@ app = typer.Typer(
 
 _SCHEMA_VERSION = 1
 _ESM2_35M_EMBEDDING_DIM = 480
+_LOCKED_V0_PROTOCOL_DIGEST = (
+    "0b2a74ff76b8c7c508ceea16b004a1c128ba15704138138d49b2c153bcbfa49a"
+)
 _SHA256_CHARS = frozenset("0123456789abcdef")
 FloatArray = NDArray[np.float64]
 
@@ -115,7 +122,15 @@ def _run_command(
     dry_run: bool,
     action: Callable[[], dict[str, object]],
 ) -> None:
-    _emit({"command": name, "event": "start", "schema_version": _SCHEMA_VERSION})
+    numerical_runtime = _jsonable(current_numerical_runtime_fingerprint())
+    _emit(
+        {
+            "command": name,
+            "event": "start",
+            "numerical_runtime": numerical_runtime,
+            "schema_version": _SCHEMA_VERSION,
+        }
+    )
     try:
         terminal = action()
     except Exception as error:
@@ -125,6 +140,7 @@ def _run_command(
                 "error": str(error),
                 "error_type": type(error).__name__,
                 "event": "terminal",
+                "numerical_runtime": numerical_runtime,
                 "schema_version": _SCHEMA_VERSION,
                 "status": "error",
             }
@@ -134,6 +150,7 @@ def _run_command(
         {
             "command": name,
             "event": "terminal",
+            "numerical_runtime": numerical_runtime,
             "schema_version": _SCHEMA_VERSION,
             "status": "planned" if dry_run else "complete",
             **terminal,
@@ -193,6 +210,23 @@ def _is_sha256(value: object) -> bool:
         and len(value) == 64
         and set(value).issubset(_SHA256_CHARS)
     )
+
+
+def _validate_execution_policy(
+    protocol: Protocol,
+    *,
+    mode: Literal["confirmatory", "development"],
+    non_official_bypass: bool,
+) -> None:
+    protocol_digest = canonical_protocol_digest(protocol)
+    if mode == "confirmatory" and non_official_bypass:
+        raise ValueError("confirmatory execution forbids --non-official-bypass")
+    if not non_official_bypass and protocol_digest != _LOCKED_V0_PROTOCOL_DIGEST:
+        raise ValueError("official execution requires the locked v0 protocol digest")
+    if mode == "confirmatory" and protocol_digest != _LOCKED_V0_PROTOCOL_DIGEST:
+        raise ValueError(
+            "confirmatory execution requires the locked v0 protocol digest"
+        )
 
 
 def _load_unique_json(path: Path) -> dict[str, object]:
@@ -503,7 +537,17 @@ def _cache_width(metadata_path: Path) -> int:
     return cast(int, shape[1])
 
 
-def _git_commit() -> str:
+def _git_commit(*, require_clean: bool = False) -> str:
+    if require_clean:
+        for arguments in (
+            ("diff", "--quiet", "--"),
+            ("diff", "--cached", "--quiet", "--"),
+        ):
+            clean = subprocess.run(["git", *arguments], check=False)
+            if clean.returncode != 0:
+                raise ValueError(
+                    "official execution requires a clean tracked Git state"
+                )
     completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         check=False,
@@ -788,6 +832,187 @@ def _validate_task_payload(payload: dict[str, object]) -> None:
                 raise ValueError(f"task artifact method {metric} is invalid")
 
 
+def _build_task_payload(
+    *,
+    protocol: Protocol,
+    manifest: DataManifest,
+    manifest_path: Path,
+    processed_root: Path,
+    embedding_root: Path,
+    assay_id: str,
+    seed: int,
+    mode: Literal["confirmatory", "development"],
+    non_official_bypass: bool,
+) -> dict[str, object]:
+    """Recompute one complete task artifact from its current pinned inputs."""
+    _validate_execution_policy(
+        protocol,
+        mode=mode,
+        non_official_bypass=non_official_bypass,
+    )
+    git_commit = _git_commit(require_clean=not non_official_bypass)
+    expected_assays = (
+        manifest.confirmatory_ids
+        if mode == "confirmatory"
+        else (manifest.development_id,)
+    )
+    if assay_id not in expected_assays or seed not in protocol.seeds:
+        raise ValueError("task identity is outside the requested exact grid")
+    if not non_official_bypass:
+        require_openblas_coretype("Haswell")
+    record = _record(manifest, assay_id)
+    parquet_path = processed_root / f"{assay_id}.parquet"
+    identity = _load_identity_frame(
+        parquet_path,
+        protocol=protocol,
+        record=record,
+    )
+    split = make_split(
+        identity,
+        assay_id,
+        seed,
+        protocol.n_labeled,
+        protocol.n_unlabeled,
+        protocol.n_test,
+    )
+    metadata_path = embedding_root / f"{assay_id}.json"
+    embedding_dim = (
+        _cache_width(metadata_path) if non_official_bypass else _ESM2_35M_EMBEDDING_DIM
+    )
+    npy_path = embedding_root / f"{assay_id}.npy"
+    embeddings = load_embedding_cache(
+        npy_path,
+        metadata_path,
+        dms_id=assay_id,
+        row_hashes=record.row_hashes,
+        model_id=protocol.model,
+        model_revision=protocol.model_revision,
+        sources=_embedding_sources(protocol),
+        expected_embedding_dim=embedding_dim,
+    )
+    y_l = _ordered_outcomes(
+        parquet_path,
+        requested_hashes=split.labeled_hashes,
+        expected_all_hashes=record.row_hashes,
+    )
+    source_digest = canonical_source_digest(protocol)
+    teacher = identity[protocol.teacher_column].to_numpy(dtype=np.float64)
+    fit_inputs = FitInputs(
+        assay_id=assay_id,
+        seed=seed,
+        source_digest=source_digest,
+        labeled_hashes=split.labeled_hashes,
+        unlabeled_hashes=split.unlabeled_hashes,
+        test_hashes=split.test_hashes,
+        x_l=embeddings[np.asarray(split.labeled, dtype=np.int64)],
+        y_l=y_l,
+        z_l=teacher[np.asarray(split.labeled, dtype=np.int64)],
+        x_u=embeddings[np.asarray(split.unlabeled, dtype=np.int64)],
+        z_u=teacher[np.asarray(split.unlabeled, dtype=np.int64)],
+        x_test=embeddings[np.asarray(split.test, dtype=np.int64)],
+        z_test=teacher[np.asarray(split.test, dtype=np.int64)],
+    )
+    fit = fit_task(fit_inputs, protocol)
+    fit_digest = canonical_fit_digest(fit)
+    labels = load_evaluation_labels(
+        parquet_path,
+        assay_id=assay_id,
+        seed=seed,
+        source_digest=source_digest,
+        labeled_hashes=split.labeled_hashes,
+        unlabeled_hashes=split.unlabeled_hashes,
+        test_hashes=split.test_hashes,
+        expected_all_hashes=record.row_hashes,
+    )
+    evaluation_digest = canonical_evaluation_digest(labels)
+    evaluation = evaluate_task(
+        fit,
+        labels,
+        protocol=protocol,
+        expected_fit_digest=fit_digest,
+        expected_evaluation_digest=evaluation_digest,
+    )
+    evaluations = {item.name: item for item in evaluation.methods}
+    methods: list[dict[str, object]] = []
+    for method in fit.methods:
+        measured = evaluations[method.name]
+        methods.append(
+            {
+                "mse": measured.mse,
+                "name": method.name,
+                "ndcg_10pct": measured.ndcg_10pct,
+                "selected_hashes": list(method.selected_hashes),
+                "selected_indices": list(method.selected_indices),
+                "selected_pseudo_label_mae": measured.selected_pseudo_label_mae,
+                "spearman": measured.spearman,
+                "test_predictions": method.test_predictions.tolist(),
+            }
+        )
+    payload: dict[str, object] = {
+        "diagnostics": {
+            "evaluation": {
+                "full_test_risk_oracle": evaluation.full_test_risk_oracle,
+                "no_hessian_test_risk_oracle": (evaluation.no_hessian_test_risk_oracle),
+                "pool_pseudo_label_mae": evaluation.pool_pseudo_label_mae,
+                "random_error_reference": evaluation.random_error_reference,
+                "teacher_test_spearman": evaluation.teacher_test_spearman,
+            },
+            "fit": fit.diagnostics,
+        },
+        "digests": {
+            "evaluation": evaluation_digest,
+            "fit": fit_digest,
+            "protocol": canonical_protocol_digest(protocol),
+            "source": source_digest,
+        },
+        "execution": {
+            "bypass": (
+                "non_official_test_or_development" if non_official_bypass else None
+            ),
+            "numerical_policy": fit.numerical_policy,
+            "numerical_runtime": fit.numerical_runtime,
+            "official": not non_official_bypass,
+        },
+        "kind": "task_result",
+        "methods": methods,
+        "provenance": {
+            "embedding_metadata_sha256": sha256_file(metadata_path),
+            "embedding_npy_sha256": sha256_file(npy_path),
+            "git_commit": git_commit,
+            "manifest_sha256": sha256_file(manifest_path),
+            "processed_sha256": sha256_file(parquet_path),
+            "sources": {
+                "metadata": protocol.metadata_sha256,
+                "scores": protocol.zero_shot_scores_sha256,
+                "substitutions": protocol.substitutions_sha256,
+                "upstream_commit": protocol.proteingym_upstream_commit,
+            },
+        },
+        "schema_version": 1,
+        "task": {
+            "assay_id": assay_id,
+            "labeled_hashes": list(split.labeled_hashes),
+            "mode": mode,
+            "seed": seed,
+            "test_hashes": list(split.test_hashes),
+            "unlabeled_hashes": list(split.unlabeled_hashes),
+        },
+    }
+    normalized = cast(dict[str, object], _jsonable(payload))
+    _validate_task_payload(normalized)
+    return normalized
+
+
+def _require_exact_payload(
+    actual: dict[str, object],
+    expected: dict[str, object],
+    *,
+    artifact_kind: str,
+) -> None:
+    if _canonical_json_bytes(actual) != _canonical_json_bytes(expected):
+        raise ValueError(f"{artifact_kind} artifact content mismatch")
+
+
 @app.command("run-task")
 def run_task(
     context: typer.Context,
@@ -825,10 +1050,10 @@ def run_task(
             task_index=task_index,
             mode=mode,
         )
-        task_mode = (
-            "development"
-            if resolved_assay == manifest.development_id
-            else "confirmatory"
+        _validate_execution_policy(
+            protocol,
+            mode=mode,
+            non_official_bypass=non_official_bypass,
         )
         destination = (
             results_root / "tasks" / resolved_assay / f"seed_{resolved_seed}.json"
@@ -844,158 +1069,22 @@ def run_task(
                 "load_hidden_labels",
                 "evaluate_and_write",
             ],
-            "task_mode": task_mode,
+            "task_mode": mode,
         }
         if options.dry_run:
             return {"plan": plan}
-        if not non_official_bypass:
-            require_openblas_coretype("Haswell")
-        record = _record(manifest, resolved_assay)
-        parquet_path = processed_root / f"{resolved_assay}.parquet"
-        identity = _load_identity_frame(
-            parquet_path,
+        payload = _build_task_payload(
             protocol=protocol,
-            record=record,
-        )
-        split = make_split(
-            identity,
-            resolved_assay,
-            resolved_seed,
-            protocol.n_labeled,
-            protocol.n_unlabeled,
-            protocol.n_test,
-        )
-        metadata_path = embedding_root / f"{resolved_assay}.json"
-        embedding_dim = (
-            _cache_width(metadata_path)
-            if non_official_bypass
-            else _ESM2_35M_EMBEDDING_DIM
-        )
-        embeddings = load_embedding_cache(
-            embedding_root / f"{resolved_assay}.npy",
-            metadata_path,
-            dms_id=resolved_assay,
-            row_hashes=record.row_hashes,
-            model_id=protocol.model,
-            model_revision=protocol.model_revision,
-            sources=_embedding_sources(protocol),
-            expected_embedding_dim=embedding_dim,
-        )
-        y_l = _ordered_outcomes(
-            parquet_path,
-            requested_hashes=split.labeled_hashes,
-            expected_all_hashes=record.row_hashes,
-        )
-        source_digest = canonical_source_digest(protocol)
-        teacher = identity[protocol.teacher_column].to_numpy(dtype=np.float64)
-        fit_inputs = FitInputs(
+            manifest=manifest,
+            manifest_path=manifest_path,
+            processed_root=processed_root,
+            embedding_root=embedding_root,
             assay_id=resolved_assay,
             seed=resolved_seed,
-            source_digest=source_digest,
-            labeled_hashes=split.labeled_hashes,
-            unlabeled_hashes=split.unlabeled_hashes,
-            test_hashes=split.test_hashes,
-            x_l=embeddings[np.asarray(split.labeled, dtype=np.int64)],
-            y_l=y_l,
-            z_l=teacher[np.asarray(split.labeled, dtype=np.int64)],
-            x_u=embeddings[np.asarray(split.unlabeled, dtype=np.int64)],
-            z_u=teacher[np.asarray(split.unlabeled, dtype=np.int64)],
-            x_test=embeddings[np.asarray(split.test, dtype=np.int64)],
-            z_test=teacher[np.asarray(split.test, dtype=np.int64)],
+            mode=mode,
+            non_official_bypass=non_official_bypass,
         )
-        fit = fit_task(fit_inputs, protocol)
-        fit_digest = canonical_fit_digest(fit)
-        labels = load_evaluation_labels(
-            parquet_path,
-            assay_id=resolved_assay,
-            seed=resolved_seed,
-            source_digest=source_digest,
-            labeled_hashes=split.labeled_hashes,
-            unlabeled_hashes=split.unlabeled_hashes,
-            test_hashes=split.test_hashes,
-            expected_all_hashes=record.row_hashes,
-        )
-        evaluation_digest = canonical_evaluation_digest(labels)
-        evaluation = evaluate_task(
-            fit,
-            labels,
-            protocol=protocol,
-            expected_fit_digest=fit_digest,
-            expected_evaluation_digest=evaluation_digest,
-        )
-        evaluations = {item.name: item for item in evaluation.methods}
-        methods: list[dict[str, object]] = []
-        for method in fit.methods:
-            measured = evaluations[method.name]
-            methods.append(
-                {
-                    "mse": measured.mse,
-                    "name": method.name,
-                    "ndcg_10pct": measured.ndcg_10pct,
-                    "selected_hashes": list(method.selected_hashes),
-                    "selected_indices": list(method.selected_indices),
-                    "selected_pseudo_label_mae": measured.selected_pseudo_label_mae,
-                    "spearman": measured.spearman,
-                    "test_predictions": method.test_predictions.tolist(),
-                }
-            )
-        payload: dict[str, object] = {
-            "diagnostics": {
-                "evaluation": {
-                    "full_test_risk_oracle": evaluation.full_test_risk_oracle,
-                    "no_hessian_test_risk_oracle": (
-                        evaluation.no_hessian_test_risk_oracle
-                    ),
-                    "pool_pseudo_label_mae": evaluation.pool_pseudo_label_mae,
-                    "random_error_reference": evaluation.random_error_reference,
-                    "teacher_test_spearman": evaluation.teacher_test_spearman,
-                },
-                "fit": fit.diagnostics,
-            },
-            "digests": {
-                "evaluation": evaluation_digest,
-                "fit": fit_digest,
-                "protocol": canonical_protocol_digest(protocol),
-                "source": source_digest,
-            },
-            "execution": {
-                "bypass": (
-                    "non_official_test_or_development" if non_official_bypass else None
-                ),
-                "numerical_policy": fit.numerical_policy,
-                "numerical_runtime": fit.numerical_runtime,
-                "official": not non_official_bypass,
-            },
-            "kind": "task_result",
-            "methods": methods,
-            "provenance": {
-                "embedding_metadata_sha256": sha256_file(metadata_path),
-                "embedding_npy_sha256": sha256_file(
-                    embedding_root / f"{resolved_assay}.npy"
-                ),
-                "git_commit": _git_commit(),
-                "manifest_sha256": sha256_file(manifest_path),
-                "processed_sha256": sha256_file(parquet_path),
-                "sources": {
-                    "metadata": protocol.metadata_sha256,
-                    "scores": protocol.zero_shot_scores_sha256,
-                    "substitutions": protocol.substitutions_sha256,
-                    "upstream_commit": protocol.proteingym_upstream_commit,
-                },
-            },
-            "schema_version": 1,
-            "task": {
-                "assay_id": resolved_assay,
-                "labeled_hashes": list(split.labeled_hashes),
-                "mode": task_mode,
-                "seed": resolved_seed,
-                "test_hashes": list(split.test_hashes),
-                "unlabeled_hashes": list(split.unlabeled_hashes),
-            },
-        }
-        normalized = cast(dict[str, object], _jsonable(payload))
-        _validate_task_payload(normalized)
-        created = _write_json_once(destination, normalized)
+        created = _write_json_once(destination, payload)
         return {
             "artifact": str(destination),
             "artifact_sha256": sha256_file(destination),
@@ -1023,90 +1112,89 @@ def _task_identity(payload: dict[str, object]) -> tuple[str, int, str]:
     return assay_id, seed, mode
 
 
-@app.command("aggregate")
-def aggregate(
-    context: typer.Context,
-    manifest_path: Annotated[Path, typer.Option("--manifest")],
-    results_root: Annotated[Path, typer.Option("--results-root")],
-    output: Annotated[Path, typer.Option("--output")],
-    mode: Annotated[
-        Literal["confirmatory", "development"],
-        typer.Option("--mode"),
-    ],
-    seeds: Annotated[list[int] | None, typer.Option("--seed")] = None,
-    bootstrap_resamples: Annotated[
-        int,
-        typer.Option("--bootstrap-resamples", min=1),
-    ] = 10_000,
-) -> None:
-    """Validate an exact task grid and emit clustered tables and diagnostics."""
-    options = _options(context)
-
-    def action() -> dict[str, object]:
-        protocol = load_protocol(options.config)
-        manifest = load_data_manifest(manifest_path)
-        _validate_manifest(protocol, manifest)
-        requested_seeds = tuple(protocol.seeds if seeds is None else seeds)
-        if (
-            not requested_seeds
-            or len(set(requested_seeds)) != len(requested_seeds)
-            or any(seed not in protocol.seeds for seed in requested_seeds)
-        ):
-            raise ValueError("aggregate seeds must be a distinct protocol subset")
-        if mode == "confirmatory" and requested_seeds != protocol.seeds:
-            raise ValueError(
-                "confirmatory aggregation requires the exact protocol seeds"
-            )
-        assay_ids = (
-            manifest.confirmatory_ids
-            if mode == "confirmatory"
-            else (manifest.development_id,)
+def _validated_aggregate_seeds(
+    protocol: Protocol,
+    seeds: Sequence[int],
+    *,
+    mode: Literal["confirmatory", "development"],
+) -> tuple[int, ...]:
+    requested = tuple(seeds)
+    if (
+        not requested
+        or len(set(requested)) != len(requested)
+        or any(
+            type(seed) is not int or seed not in protocol.seeds for seed in requested
         )
-        expected_paths = [
-            results_root / "tasks" / assay / f"seed_{seed}.json"
-            for assay in assay_ids
-            for seed in requested_seeds
-        ]
-        plan = {
-            "assay_ids": list(assay_ids),
-            "mode": mode,
-            "output": str(output),
-            "seeds": list(requested_seeds),
-            "task_artifacts": [str(path) for path in expected_paths],
-        }
-        if options.dry_run:
-            return {"plan": plan}
-        long_rows: list[dict[str, object]] = []
-        diagnostic_rows: list[dict[str, object]] = []
-        protocol_digest = canonical_protocol_digest(protocol)
-        source_digest = canonical_source_digest(protocol)
-        manifest_digest = sha256_file(manifest_path)
-        seen: set[tuple[str, int]] = set()
-        for path in expected_paths:
+    ):
+        raise ValueError("aggregate seeds must be a distinct protocol subset")
+    if mode == "confirmatory" and requested != protocol.seeds:
+        raise ValueError("confirmatory aggregation requires the exact protocol seeds")
+    return requested
+
+
+def _build_aggregate_payload(
+    *,
+    protocol: Protocol,
+    manifest: DataManifest,
+    manifest_path: Path,
+    processed_root: Path,
+    embedding_root: Path,
+    results_root: Path,
+    mode: Literal["confirmatory", "development"],
+    seeds: Sequence[int],
+    bootstrap_resamples: int,
+    non_official_bypass: bool,
+) -> dict[str, object]:
+    """Independently rebuild every task and all aggregate-derived content."""
+    _validate_execution_policy(
+        protocol,
+        mode=mode,
+        non_official_bypass=non_official_bypass,
+    )
+    if type(bootstrap_resamples) is not int or bootstrap_resamples <= 0:
+        raise ValueError("bootstrap_resamples must be a positive integer")
+    if mode == "confirmatory" and bootstrap_resamples != 10_000:
+        raise ValueError("confirmatory aggregation requires 10000 bootstrap resamples")
+    requested_seeds = _validated_aggregate_seeds(protocol, seeds, mode=mode)
+    assay_ids = (
+        manifest.confirmatory_ids
+        if mode == "confirmatory"
+        else (manifest.development_id,)
+    )
+    long_rows: list[dict[str, object]] = []
+    diagnostic_rows: list[dict[str, object]] = []
+    task_manifest: list[dict[str, object]] = []
+    git_commits: set[str] = set()
+    runtime_payloads: set[bytes] = set()
+    numerical_runtime: object | None = None
+    for assay_id in assay_ids:
+        for seed in requested_seeds:
+            path = results_root / "tasks" / assay_id / f"seed_{seed}.json"
             if not path.is_file():
                 raise ValueError(f"missing task artifact: {path}")
-            payload = _load_unique_json(path)
-            _validate_task_payload(payload)
-            assay_id, seed, task_mode = _task_identity(payload)
-            key = (assay_id, seed)
-            if key in seen:
-                raise ValueError("duplicate task artifact identity")
-            seen.add(key)
-            if task_mode != mode or key not in {
-                (assay, task_seed)
-                for assay in assay_ids
-                for task_seed in requested_seeds
-            }:
-                raise ValueError("task artifact is outside the requested exact grid")
-            digests = cast(dict[str, object], payload["digests"])
-            provenance = cast(dict[str, object], payload["provenance"])
-            if digests.get("protocol") != protocol_digest:
-                raise ValueError("task protocol digest mismatch")
-            if digests.get("source") != source_digest:
-                raise ValueError("task source digest mismatch")
-            if provenance.get("manifest_sha256") != manifest_digest:
-                raise ValueError("task manifest digest mismatch")
-            methods = cast(list[dict[str, object]], payload["methods"])
+            actual = _load_unique_json(path)
+            _validate_task_payload(actual)
+            expected = _build_task_payload(
+                protocol=protocol,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                processed_root=processed_root,
+                embedding_root=embedding_root,
+                assay_id=assay_id,
+                seed=seed,
+                mode=mode,
+                non_official_bypass=non_official_bypass,
+            )
+            _require_exact_payload(actual, expected, artifact_kind="task")
+            provenance = cast(dict[str, object], actual["provenance"])
+            execution = cast(dict[str, object], actual["execution"])
+            git_commit = provenance.get("git_commit")
+            if not isinstance(git_commit, str):
+                raise ValueError("task git commit is invalid")
+            git_commits.add(git_commit)
+            numerical_runtime = execution.get("numerical_runtime")
+            runtime_payloads.add(_canonical_json_bytes(numerical_runtime))
+            methods = cast(list[dict[str, object]], actual["methods"])
             for method in methods:
                 long_rows.append(
                     {
@@ -1118,73 +1206,167 @@ def aggregate(
                         "spearman": method["spearman"],
                     }
                 )
+            task_sha = sha256_file(path)
             diagnostic_rows.append(
                 {
                     "assay_id": assay_id,
-                    "diagnostics": payload["diagnostics"],
+                    "diagnostics": actual["diagnostics"],
                     "seed": seed,
-                    "task_artifact_sha256": sha256_file(path),
+                    "task_artifact_sha256": task_sha,
                 }
             )
-        results = pd.DataFrame(long_rows)
-        if mode == "confirmatory":
-            validated = validate_v0_result_table(
-                results,
-                assay_ids=assay_ids,
-                protocol=protocol,
-                require_no_hessian=True,
+            task_manifest.append(
+                {
+                    "assay_id": assay_id,
+                    "seed": seed,
+                    "sha256": task_sha,
+                }
             )
-        else:
-            validated = validate_result_table(
-                results,
-                assay_ids=assay_ids,
-                seeds=requested_seeds,
-                required_methods=METHOD_NAMES,
-            )
-        comparisons = (
-            ("ours", "supervised"),
-            ("ours", "random"),
-            ("ours", "top_teacher"),
-            ("ours", "no_hessian"),
+    if len(git_commits) != 1 or len(runtime_payloads) != 1:
+        raise ValueError("task grid mixes implementations or numerical runtimes")
+    results = pd.DataFrame(long_rows)
+    if mode == "confirmatory":
+        validated = validate_v0_result_table(
+            results,
+            assay_ids=assay_ids,
+            protocol=protocol,
+            require_no_hessian=True,
         )
-        methods_table = method_summary_table(validated)
-        effects_table = comparison_summary_table(
-            validated,
-            comparisons=comparisons,
-            analysis_seed=protocol.analysis_seed,
-            n_resamples=bootstrap_resamples,
+    else:
+        validated = validate_result_table(
+            results,
+            assay_ids=assay_ids,
+            seeds=requested_seeds,
+            required_methods=METHOD_NAMES,
         )
-        verdict = v0_analysis_verdict(validated) if mode == "confirmatory" else None
-        aggregate_payload: dict[str, object] = {
-            "analysis": {
-                "analysis_seed": protocol.analysis_seed,
-                "bootstrap_resamples": bootstrap_resamples,
-                "inference_unit": "assay",
-                "sign_flip": "exact",
-            },
-            "diagnostics": diagnostic_rows,
-            "effect_table": effects_table.to_dict(orient="records"),
-            "kind": "aggregate_result",
-            "long_results": validated.to_dict(orient="records"),
-            "method_table": methods_table.to_dict(orient="records"),
-            "mode": mode,
-            "provenance": {
-                "git_commit": _git_commit(),
-                "manifest_sha256": manifest_digest,
-                "protocol_digest": protocol_digest,
-                "task_count": len(seen),
-            },
-            "schema_version": 1,
-            "v0_verdict": verdict,
-        }
-        normalized = cast(dict[str, object], _jsonable(aggregate_payload))
-        created = _write_json_once(output, normalized)
+    comparisons = (
+        ("ours", "supervised"),
+        ("ours", "random"),
+        ("ours", "top_teacher"),
+        ("ours", "no_hessian"),
+    )
+    methods_table = method_summary_table(validated)
+    effects_table = comparison_summary_table(
+        validated,
+        comparisons=comparisons,
+        analysis_seed=protocol.analysis_seed,
+        n_resamples=bootstrap_resamples,
+    )
+    verdict = v0_analysis_verdict(validated) if mode == "confirmatory" else None
+    payload: dict[str, object] = {
+        "analysis": {
+            "analysis_seed": protocol.analysis_seed,
+            "bootstrap_resamples": bootstrap_resamples,
+            "inference_unit": "assay",
+            "sign_flip": "exact",
+        },
+        "diagnostics": diagnostic_rows,
+        "effect_table": effects_table.to_dict(orient="records"),
+        "execution": {
+            "bypass": (
+                "non_official_test_or_development" if non_official_bypass else None
+            ),
+            "numerical_policy": NUMERICAL_POLICY,
+            "numerical_runtime": numerical_runtime,
+            "official": not non_official_bypass,
+        },
+        "grid": {
+            "assay_ids": list(assay_ids),
+            "seeds": list(requested_seeds),
+        },
+        "kind": "aggregate_result",
+        "long_results": validated.to_dict(orient="records"),
+        "method_table": methods_table.to_dict(orient="records"),
+        "mode": mode,
+        "provenance": {
+            "git_commit": git_commits.pop(),
+            "manifest_sha256": sha256_file(manifest_path),
+            "protocol_digest": canonical_protocol_digest(protocol),
+            "task_count": len(task_manifest),
+            "task_manifest": task_manifest,
+        },
+        "schema_version": 1,
+        "v0_verdict": verdict,
+    }
+    return cast(dict[str, object], _jsonable(payload))
+
+
+@app.command("aggregate")
+def aggregate(
+    context: typer.Context,
+    manifest_path: Annotated[Path, typer.Option("--manifest")],
+    processed_root: Annotated[Path, typer.Option("--processed-root")],
+    embedding_root: Annotated[Path, typer.Option("--embedding-root")],
+    results_root: Annotated[Path, typer.Option("--results-root")],
+    output: Annotated[Path, typer.Option("--output")],
+    mode: Annotated[
+        Literal["confirmatory", "development"],
+        typer.Option("--mode"),
+    ],
+    seeds: Annotated[list[int] | None, typer.Option("--seed")] = None,
+    bootstrap_resamples: Annotated[
+        int,
+        typer.Option("--bootstrap-resamples", min=1),
+    ] = 10_000,
+    non_official_bypass: Annotated[
+        bool,
+        typer.Option("--non-official-bypass"),
+    ] = False,
+) -> None:
+    """Rebuild an exact task grid and emit clustered tables and diagnostics."""
+    options = _options(context)
+
+    def action() -> dict[str, object]:
+        protocol = load_protocol(options.config)
+        manifest = load_data_manifest(manifest_path)
+        _validate_manifest(protocol, manifest)
+        requested_seeds = tuple(protocol.seeds if seeds is None else seeds)
+        _validate_execution_policy(
+            protocol,
+            mode=mode,
+            non_official_bypass=non_official_bypass,
+        )
+        _validated_aggregate_seeds(protocol, requested_seeds, mode=mode)
+        assay_ids = (
+            manifest.confirmatory_ids
+            if mode == "confirmatory"
+            else (manifest.development_id,)
+        )
+        expected_paths = [
+            results_root / "tasks" / assay / f"seed_{seed}.json"
+            for assay in assay_ids
+            for seed in requested_seeds
+        ]
+        if options.dry_run:
+            return {
+                "plan": {
+                    "assay_ids": list(assay_ids),
+                    "mode": mode,
+                    "output": str(output),
+                    "seeds": list(requested_seeds),
+                    "task_artifacts": [str(path) for path in expected_paths],
+                }
+            }
+        payload = _build_aggregate_payload(
+            protocol=protocol,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            processed_root=processed_root,
+            embedding_root=embedding_root,
+            results_root=results_root,
+            mode=mode,
+            seeds=requested_seeds,
+            bootstrap_resamples=bootstrap_resamples,
+            non_official_bypass=non_official_bypass,
+        )
+        created = _write_json_once(output, payload)
+        long_results = cast(list[object], payload["long_results"])
         return {
             "artifact": str(output),
             "artifact_sha256": sha256_file(output),
             "created": created,
             "mode": mode,
-            "row_count": len(validated),
+            "row_count": len(long_results),
         }
 
     _run_command("aggregate", dry_run=options.dry_run, action=action)
@@ -1194,18 +1376,30 @@ def _verify_task_context(
     path: Path,
     *,
     protocol: Protocol,
+    manifest: DataManifest,
     manifest_path: Path,
+    processed_root: Path,
+    embedding_root: Path,
+    non_official_bypass: bool,
 ) -> None:
-    payload = _load_unique_json(path)
-    _validate_task_payload(payload)
-    digests = cast(dict[str, object], payload["digests"])
-    provenance = cast(dict[str, object], payload["provenance"])
-    if digests.get("protocol") != canonical_protocol_digest(protocol):
-        raise ValueError(f"task protocol mismatch: {path}")
-    if digests.get("source") != canonical_source_digest(protocol):
-        raise ValueError(f"task source digest mismatch: {path}")
-    if provenance.get("manifest_sha256") != sha256_file(manifest_path):
-        raise ValueError(f"task manifest mismatch: {path}")
+    actual = _load_unique_json(path)
+    _validate_task_payload(actual)
+    assay_id, seed, raw_mode = _task_identity(actual)
+    if raw_mode not in ("confirmatory", "development"):
+        raise ValueError("task mode is invalid")
+    mode = cast(Literal["confirmatory", "development"], raw_mode)
+    expected = _build_task_payload(
+        protocol=protocol,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        processed_root=processed_root,
+        embedding_root=embedding_root,
+        assay_id=assay_id,
+        seed=seed,
+        mode=mode,
+        non_official_bypass=non_official_bypass,
+    )
+    _require_exact_payload(actual, expected, artifact_kind="task")
 
 
 @app.command("verify")
@@ -1214,12 +1408,17 @@ def verify(
     manifest_path: Annotated[Path | None, typer.Option("--manifest")] = None,
     processed_root: Annotated[Path | None, typer.Option("--processed-root")] = None,
     embedding_root: Annotated[Path | None, typer.Option("--embedding-root")] = None,
+    results_root: Annotated[Path | None, typer.Option("--results-root")] = None,
     task_artifact: Annotated[Path | None, typer.Option("--task-artifact")] = None,
     aggregate_artifact: Annotated[
         Path | None,
         typer.Option("--aggregate-artifact"),
     ] = None,
     runtime_only: Annotated[bool, typer.Option("--runtime-only")] = False,
+    non_official_bypass: Annotated[
+        bool,
+        typer.Option("--non-official-bypass"),
+    ] = False,
 ) -> None:
     """Fail closed on protocol, manifest, cache, task, or aggregate corruption."""
     options = _options(context)
@@ -1232,6 +1431,7 @@ def verify(
                     manifest_path,
                     processed_root,
                     embedding_root,
+                    results_root,
                     task_artifact,
                     aggregate_artifact,
                 )
@@ -1252,6 +1452,7 @@ def verify(
             "embedding_root": str(embedding_root) if embedding_root else None,
             "manifest": str(manifest_path),
             "processed_root": str(processed_root) if processed_root else None,
+            "results_root": str(results_root) if results_root else None,
             "task_artifact": str(task_artifact) if task_artifact else None,
         }
         if options.dry_run:
@@ -1259,6 +1460,13 @@ def verify(
         protocol = load_protocol(options.config)
         manifest = load_data_manifest(manifest_path)
         _validate_manifest(protocol, manifest)
+        _validate_execution_policy(
+            protocol,
+            mode="development",
+            non_official_bypass=non_official_bypass,
+        )
+        if not non_official_bypass:
+            require_openblas_coretype("Haswell")
         verified = ["config", "manifest"]
         for record in manifest.selected_assays:
             if processed_root is not None:
@@ -1277,39 +1485,103 @@ def verify(
                     model_id=protocol.model,
                     model_revision=protocol.model_revision,
                     sources=_embedding_sources(protocol),
-                    expected_embedding_dim=_cache_width(metadata_path),
+                    expected_embedding_dim=(
+                        _cache_width(metadata_path)
+                        if non_official_bypass
+                        else _ESM2_35M_EMBEDDING_DIM
+                    ),
                 )
         if processed_root is not None:
             verified.append("processed")
         if embedding_root is not None:
             verified.append("embeddings")
         if task_artifact is not None:
+            if processed_root is None or embedding_root is None:
+                raise ValueError(
+                    "task verification requires --processed-root and --embedding-root"
+                )
             _verify_task_context(
                 task_artifact,
                 protocol=protocol,
+                manifest=manifest,
                 manifest_path=manifest_path,
+                processed_root=processed_root,
+                embedding_root=embedding_root,
+                non_official_bypass=non_official_bypass,
             )
             verified.append("task")
         if aggregate_artifact is not None:
+            if processed_root is None or embedding_root is None or results_root is None:
+                raise ValueError(
+                    "aggregate verification requires --processed-root, "
+                    "--embedding-root, and --results-root"
+                )
             aggregate_payload = _load_unique_json(aggregate_artifact)
             if (
                 aggregate_payload.get("schema_version") != 1
                 or aggregate_payload.get("kind") != "aggregate_result"
             ):
                 raise ValueError("aggregate artifact schema is invalid")
-            aggregate_provenance = aggregate_payload.get("provenance")
-            if not isinstance(aggregate_provenance, dict) or (
-                aggregate_provenance.get("protocol_digest")
-                != canonical_protocol_digest(protocol)
-                or aggregate_provenance.get("manifest_sha256")
-                != sha256_file(manifest_path)
+            raw_mode = aggregate_payload.get("mode")
+            grid = aggregate_payload.get("grid")
+            analysis = aggregate_payload.get("analysis")
+            if (
+                raw_mode not in ("confirmatory", "development")
+                or not isinstance(grid, dict)
+                or not isinstance(grid.get("seeds"), list)
+                or not isinstance(analysis, dict)
+                or type(analysis.get("bootstrap_resamples")) is not int
             ):
-                raise ValueError("aggregate provenance mismatch")
+                raise ValueError("aggregate reconstruction metadata is invalid")
+            aggregate_mode: Literal["confirmatory", "development"] = (
+                "confirmatory" if raw_mode == "confirmatory" else "development"
+            )
+            aggregate_seeds = cast(list[object], grid["seeds"])
+            if any(type(seed) is not int for seed in aggregate_seeds):
+                raise ValueError("aggregate seed grid is invalid")
+            expected_aggregate = _build_aggregate_payload(
+                protocol=protocol,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                processed_root=processed_root,
+                embedding_root=embedding_root,
+                results_root=results_root,
+                mode=aggregate_mode,
+                seeds=cast(list[int], aggregate_seeds),
+                bootstrap_resamples=cast(int, analysis["bootstrap_resamples"]),
+                non_official_bypass=non_official_bypass,
+            )
+            _require_exact_payload(
+                aggregate_payload,
+                expected_aggregate,
+                artifact_kind="aggregate",
+            )
             verified.append("aggregate")
         return {"verified": verified}
 
     _run_command("verify", dry_run=options.dry_run, action=action)
 
 
+def cli_main() -> None:
+    """Run Typer while normalizing parse-time usage failures to JSON."""
+    try:
+        app(standalone_mode=False)
+    except _click.ClickException as error:
+        _emit(
+            {
+                "command": sys.argv[1] if len(sys.argv) > 1 else None,
+                "error": error.format_message(),
+                "error_type": type(error).__name__,
+                "event": "terminal",
+                "numerical_runtime": current_numerical_runtime_fingerprint(),
+                "schema_version": _SCHEMA_VERSION,
+                "status": "error",
+            }
+        )
+        raise SystemExit(error.exit_code) from error
+    except _click.exceptions.Exit as error:
+        raise SystemExit(error.exit_code) from error
+
+
 if __name__ == "__main__":
-    app()
+    cli_main()

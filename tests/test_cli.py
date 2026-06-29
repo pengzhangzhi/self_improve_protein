@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -170,6 +172,37 @@ def _run_task_args(paths: dict[str, Path]) -> list[str]:
     ]
 
 
+def _aggregate_args(
+    paths: dict[str, Path],
+    output: Path,
+    *,
+    seeds: tuple[int, ...] = (0,),
+) -> list[str]:
+    args = [
+        "--config",
+        str(paths["config"]),
+        "aggregate",
+        "--manifest",
+        str(paths["manifest"]),
+        "--processed-root",
+        str(paths["processed"]),
+        "--embedding-root",
+        str(paths["embeddings"]),
+        "--results-root",
+        str(paths["results"]),
+        "--output",
+        str(output),
+        "--mode",
+        "development",
+        "--bootstrap-resamples",
+        "20",
+        "--non-official-bypass",
+    ]
+    for seed in seeds:
+        args.extend(("--seed", str(seed)))
+    return args
+
+
 def test_cli_help_exposes_five_commands_and_global_options() -> None:
     result = RUNNER.invoke(app, ["--help"])
 
@@ -178,6 +211,21 @@ def test_cli_help_exposes_five_commands_and_global_options() -> None:
         assert command in result.output
     assert "--config" in result.output
     assert "--dry-run" in result.output
+
+
+def test_console_usage_error_is_one_terminal_json_record_without_false_start() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "self_improve_protein.cli", "prepare-data"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    records = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert len(records) == 1
+    assert records[0]["event"] == "terminal"
+    assert records[0]["status"] == "error"
 
 
 def test_dry_run_emits_normalized_records_without_mutation(tmp_path: Path) -> None:
@@ -192,6 +240,7 @@ def test_dry_run_emits_normalized_records_without_mutation(tmp_path: Path) -> No
     assert result.exit_code == 0, result.output
     records = [json.loads(line) for line in result.output.splitlines()]
     assert [record["event"] for record in records] == ["start", "terminal"]
+    assert all(record["numerical_runtime"]["libraries"] for record in records)
     assert records[-1]["status"] == "planned"
     assert records[-1]["plan"]["assay_id"] == "BBB"
     assert not planned_results.exists()
@@ -329,26 +378,7 @@ def test_development_aggregate_is_explicit_and_cannot_emit_v0_verdict(
     assert task.exit_code == 0, task.output
     aggregate_path = tmp_path / "aggregate.json"
 
-    result = RUNNER.invoke(
-        app,
-        [
-            "--config",
-            str(paths["config"]),
-            "aggregate",
-            "--manifest",
-            str(paths["manifest"]),
-            "--results-root",
-            str(paths["results"]),
-            "--output",
-            str(aggregate_path),
-            "--mode",
-            "development",
-            "--seed",
-            "0",
-            "--bootstrap-resamples",
-            "20",
-        ],
-    )
+    result = RUNNER.invoke(app, _aggregate_args(paths, aggregate_path))
 
     assert result.exit_code == 0, result.output
     aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
@@ -364,6 +394,10 @@ def test_development_aggregate_is_explicit_and_cannot_emit_v0_verdict(
             "aggregate",
             "--manifest",
             str(paths["manifest"]),
+            "--processed-root",
+            str(paths["processed"]),
+            "--embedding-root",
+            str(paths["embeddings"]),
             "--results-root",
             str(paths["results"]),
             "--output",
@@ -391,28 +425,171 @@ def test_aggregate_rejects_task_source_digest_outside_protocol_root(
 
     aggregate = RUNNER.invoke(
         app,
-        [
-            "--config",
-            str(paths["config"]),
-            "aggregate",
-            "--manifest",
-            str(paths["manifest"]),
-            "--results-root",
-            str(paths["results"]),
-            "--output",
-            str(tmp_path / "aggregate.json"),
-            "--mode",
-            "development",
-            "--seed",
-            "0",
-            "--bootstrap-resamples",
-            "20",
-        ],
+        _aggregate_args(paths, tmp_path / "aggregate.json"),
     )
 
     assert aggregate.exit_code != 0
-    assert "source digest mismatch" in aggregate.output
+    assert "content mismatch" in aggregate.output
     assert not (tmp_path / "aggregate.json").exists()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("metric", "selection", "prediction", "git", "fingerprint"),
+)
+def test_aggregate_reconstructs_tasks_instead_of_trusting_stored_content(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    paths = _synthetic_workspace(tmp_path)
+    task = RUNNER.invoke(app, _run_task_args(paths))
+    assert task.exit_code == 0, task.output
+    task_path = paths["results"] / "tasks" / "BBB" / "seed_0.json"
+    payload = json.loads(task_path.read_text(encoding="utf-8"))
+    if tamper == "metric":
+        payload["methods"][0]["spearman"] += 0.25
+    elif tamper == "selection":
+        payload["methods"][1]["selected_indices"] = []
+        payload["methods"][1]["selected_hashes"] = []
+    elif tamper == "prediction":
+        payload["methods"][0]["test_predictions"] = [0.0] * 10
+    elif tamper == "git":
+        payload["provenance"]["git_commit"] = "f" * 40
+    elif tamper == "fingerprint":
+        payload["execution"]["numerical_runtime"]["libraries"][0]["architecture"] = (
+            "Fakewell"
+        )
+    else:
+        raise AssertionError(tamper)
+    task_path.write_text(json.dumps(payload), encoding="utf-8")
+    output = tmp_path / "aggregate.json"
+
+    aggregate = RUNNER.invoke(app, _aggregate_args(paths, output))
+
+    assert aggregate.exit_code != 0
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("long_results", "method_table", "effect_table", "verdict"),
+)
+def test_verify_recomputes_aggregate_instead_of_trusting_tables(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    paths = _synthetic_workspace(tmp_path)
+    task = RUNNER.invoke(app, _run_task_args(paths))
+    assert task.exit_code == 0, task.output
+    aggregate_path = tmp_path / "aggregate.json"
+    aggregate = RUNNER.invoke(app, _aggregate_args(paths, aggregate_path))
+    assert aggregate.exit_code == 0, aggregate.output
+    payload = json.loads(aggregate_path.read_text(encoding="utf-8"))
+    if tamper == "long_results":
+        payload["long_results"][0]["mse"] += 0.5
+    elif tamper == "method_table":
+        payload["method_table"][0]["mean_spearman"] += 0.5
+    elif tamper == "effect_table":
+        payload["effect_table"][0]["mean_spearman_gain"] += 0.5
+    elif tamper == "verdict":
+        payload["v0_verdict"] = {"fabricated": True}
+    else:
+        raise AssertionError(tamper)
+    aggregate_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    verified = RUNNER.invoke(
+        app,
+        [
+            "--config",
+            str(paths["config"]),
+            "verify",
+            "--manifest",
+            str(paths["manifest"]),
+            "--processed-root",
+            str(paths["processed"]),
+            "--embedding-root",
+            str(paths["embeddings"]),
+            "--results-root",
+            str(paths["results"]),
+            "--aggregate-artifact",
+            str(aggregate_path),
+            "--non-official-bypass",
+        ],
+    )
+
+    assert verified.exit_code != 0
+
+
+@pytest.mark.parametrize("tamper", ("git", "fingerprint"))
+def test_aggregate_rejects_mixed_task_implementations_and_runtimes(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    paths = _synthetic_workspace(tmp_path)
+    first = RUNNER.invoke(app, _run_task_args(paths))
+    assert first.exit_code == 0, first.output
+    second_args = _run_task_args(paths)
+    second_args[second_args.index("0")] = "1"
+    second = RUNNER.invoke(app, second_args)
+    assert second.exit_code == 0, second.output
+    second_path = paths["results"] / "tasks" / "BBB" / "seed_1.json"
+    payload = json.loads(second_path.read_text(encoding="utf-8"))
+    if tamper == "git":
+        payload["provenance"]["git_commit"] = "f" * 40
+    else:
+        payload["execution"]["numerical_runtime"]["libraries"][0]["architecture"] = (
+            "Fakewell"
+        )
+    second_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    aggregate = RUNNER.invoke(
+        app,
+        _aggregate_args(paths, tmp_path / "mixed.json", seeds=(0, 1)),
+    )
+
+    assert aggregate.exit_code != 0
+    assert not (tmp_path / "mixed.json").exists()
+
+
+def test_aggregate_rejects_fabricated_schema_only_task(tmp_path: Path) -> None:
+    paths = _synthetic_workspace(tmp_path)
+    task = RUNNER.invoke(app, _run_task_args(paths))
+    assert task.exit_code == 0, task.output
+    task_path = paths["results"] / "tasks" / "BBB" / "seed_0.json"
+    payload = json.loads(task_path.read_text(encoding="utf-8"))
+    payload["methods"] = [
+        {"name": name, "spearman": 0.1, "mse": 0.1, "ndcg_10pct": 0.1}
+        for name in ("supervised", "random", "top_teacher", "ours", "no_hessian")
+    ]
+    task_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    aggregate = RUNNER.invoke(
+        app,
+        _aggregate_args(paths, tmp_path / "fabricated.json"),
+    )
+
+    assert aggregate.exit_code != 0
+    assert not (tmp_path / "fabricated.json").exists()
+
+
+def test_confirmatory_refuses_non_official_bypass_and_alternate_protocol(
+    tmp_path: Path,
+) -> None:
+    paths = _synthetic_workspace(tmp_path)
+    args = _run_task_args(paths)
+    args[args.index("BBB")] = "AAA"
+    args[args.index("development")] = "confirmatory"
+
+    bypass = RUNNER.invoke(app, args)
+
+    assert bypass.exit_code != 0
+    assert "confirmatory" in bypass.output
+
+    args.remove("--non-official-bypass")
+    args.insert(2, "--dry-run")
+    alternate = RUNNER.invoke(app, args)
+    assert alternate.exit_code != 0
+    assert "locked v0 protocol" in alternate.output
 
 
 def test_verify_fails_closed_after_cache_corruption(tmp_path: Path) -> None:
@@ -429,6 +606,7 @@ def test_verify_fails_closed_after_cache_corruption(tmp_path: Path) -> None:
             str(paths["processed"]),
             "--embedding-root",
             str(paths["embeddings"]),
+            "--non-official-bypass",
         ],
     )
     assert valid.exit_code == 0, valid.output
@@ -447,7 +625,63 @@ def test_verify_fails_closed_after_cache_corruption(tmp_path: Path) -> None:
             str(paths["processed"]),
             "--embedding-root",
             str(paths["embeddings"]),
+            "--non-official-bypass",
         ],
     )
     assert invalid.exit_code != 0
     assert "checksum" in invalid.output or "corrupt" in invalid.output
+
+
+def test_task_verify_rebuilds_current_processed_and_embedding_inputs(
+    tmp_path: Path,
+) -> None:
+    paths = _synthetic_workspace(tmp_path)
+    task = RUNNER.invoke(app, _run_task_args(paths))
+    assert task.exit_code == 0, task.output
+    artifact = paths["results"] / "tasks" / "BBB" / "seed_0.json"
+    args = [
+        "--config",
+        str(paths["config"]),
+        "verify",
+        "--manifest",
+        str(paths["manifest"]),
+        "--processed-root",
+        str(paths["processed"]),
+        "--embedding-root",
+        str(paths["embeddings"]),
+        "--task-artifact",
+        str(artifact),
+        "--non-official-bypass",
+    ]
+    valid = RUNNER.invoke(app, args)
+    assert valid.exit_code == 0, valid.output
+    with (paths["processed"] / "BBB.parquet").open("ab") as handle:
+        handle.write(b"tampered")
+
+    invalid = RUNNER.invoke(app, args)
+
+    assert invalid.exit_code != 0
+
+
+def test_five_wide_cache_is_not_accepted_as_official_without_bypass(
+    tmp_path: Path,
+) -> None:
+    paths = _synthetic_workspace(tmp_path)
+
+    result = RUNNER.invoke(
+        app,
+        [
+            "--config",
+            str(paths["config"]),
+            "verify",
+            "--manifest",
+            str(paths["manifest"]),
+            "--processed-root",
+            str(paths["processed"]),
+            "--embedding-root",
+            str(paths["embeddings"]),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "locked v0 protocol" in result.output

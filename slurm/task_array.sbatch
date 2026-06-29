@@ -23,7 +23,7 @@ manifest="${SI_MANIFEST:-${SI_ARTIFACT_ROOT}/studies/v0/data_manifest.json}"
 processed_root="${SI_PROCESSED_ROOT:-${SI_DATA_ROOT}/processed/v0}"
 embedding_root="${SI_EMBEDDING_ROOT:-${SI_DATA_ROOT}/embeddings/v0}"
 results_root="${SI_RESULTS_ROOT:-${SI_ARTIFACT_ROOT}/studies/v0}"
-mode="${SI_MODE:-confirmatory}"
+mode="${SI_MODE:-development}"
 
 cd "$SI_REPO_ROOT"
 .venv/bin/python -c 'from self_improve_protein.experiment import require_openblas_coretype; require_openblas_coretype("Haswell")'

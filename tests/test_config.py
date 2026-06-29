@@ -17,7 +17,7 @@ def test_package_publishes_reviewed_console_script() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert pyproject["project"]["scripts"] == {
-        "self-improve-protein": "self_improve_protein.cli:app"
+        "self-improve-protein": "self_improve_protein.cli:cli_main"
     }
 
 
