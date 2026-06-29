@@ -14,6 +14,8 @@
 
 **Guardrails:** No non-finite tasks; selections and fitted parameters are invariant to hidden-label perturbation; all pseudo methods use identical labels/count/weight; report MSE and NDCG@10% without using them to overturn the primary decision. Report practical self-improvement only if `ours - supervised` assay-macro Spearman is positive.
 
+**Numerical reproducibility:** Official task launchers must export `OPENBLAS_CORETYPE=Haswell` before Python/NumPy starts and verify the active core. Fit artifacts record a stable numerical-runtime fingerprint, and BLAS-scoped calls serialize within a process. Exact hashes are comparable only for identical fingerprints. Across different fingerprints, require identical discrete selections plus predeclared tight numerical equivalence and preserve distinct exact artifact hashes.
+
 **Data / split:** ProteinGym v1.3 substitutions from Zenodo record `15293562`, literal teacher column `ESM1v_ensemble`, first eight lexicographically sorted assays with at least 6,000 usable variants and length at most 512. Per seed: 96 labeled, 2,000 unlabeled, 1,000 test from a fixed hash-sorted 6,000-row working set. The ninth eligible assay is development-only.
 
 **Leakage check:** Selector and fit functions cannot accept hidden unlabeled/test labels. Freeze data checksums, assay IDs, working-set hashes, split hashes, and the canonical fit digest before unblinding. After a verified hash join aligns hidden outcomes to the ordered split hashes, freeze a separate evaluation-label digest before metric computation. Evaluation requires both frozen digests plus the locked protocol trust root; verify selection invariance after permuting hidden labels.

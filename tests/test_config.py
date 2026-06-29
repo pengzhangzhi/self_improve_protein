@@ -282,6 +282,22 @@ def test_task_plan_requires_external_fit_digest_and_names_oracle_precisely() -> 
     assert "frozen teacher pseudo-gradient" in plan
 
 
+def test_cluster_plan_pins_blas_core_and_documents_fingerprint_equivalence() -> None:
+    plan = Path(
+        "docs/superpowers/plans/2026-06-29-proteingym-v0-implementation.md"
+    ).read_text(encoding="utf-8")
+    card = Path("docs/research/experiment-card-v0.md").read_text(encoding="utf-8")
+    ladder = Path("docs/research/feedback-ladder.md").read_text(encoding="utf-8")
+    combined = "\n".join((plan, card, ladder))
+
+    assert "OPENBLAS_CORETYPE=Haswell" in plan
+    assert "before Python/NumPy starts" in plan
+    assert "serialize within a process" in combined
+    assert "numerical-runtime fingerprint" in combined
+    assert "distinct exact artifact hashes" in combined
+    assert "tight numerical equivalence" in combined
+
+
 def test_protocol_rejects_unknown_fields() -> None:
     data = _protocol_data()
     data["unlocked_override"] = True

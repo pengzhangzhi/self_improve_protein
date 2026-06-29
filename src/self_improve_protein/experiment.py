@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
 import numpy as np
 from numpy.typing import NDArray
-from threadpoolctl import threadpool_limits  # type: ignore[import-untyped]
+from threadpoolctl import (  # type: ignore[import-untyped]
+    threadpool_info,
+    threadpool_limits,
+)
 
 from self_improve_protein.config import Protocol
 from self_improve_protein.metrics import (
@@ -58,6 +64,7 @@ METHOD_NAMES: tuple[MethodName, ...] = (
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _BLAS_THREAD_LIMIT = 1
 NUMERICAL_POLICY = "threadpoolctl:blas_threads=1"
+_BLAS_SCOPE_LOCK = threading.RLock()
 _SOURCE_IDENTITY_FIELDS = (
     "data_release",
     "substitutions_url",
@@ -72,6 +79,19 @@ _SOURCE_IDENTITY_FIELDS = (
     "model_revision",
     "max_length",
 )
+
+
+@contextmanager
+def _locked_blas_scope() -> Iterator[None]:
+    """Serialize process-global BLAS limiting and restore it on every exit."""
+    with (
+        _BLAS_SCOPE_LOCK,
+        threadpool_limits(
+            limits=_BLAS_THREAD_LIMIT,
+            user_api="blas",
+        ),
+    ):
+        yield
 
 
 def _canonical_payload_digest(payload: object) -> str:
@@ -181,12 +201,11 @@ def _scaled_algebra_close(first: object, second: object) -> bool:
         return False
     if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
         return False
-    scale = max(
+    elementwise_scale = np.maximum(
         1.0,
-        float(np.max(np.abs(left))) if left.size else 0.0,
-        float(np.max(np.abs(right))) if right.size else 0.0,
+        np.maximum(np.abs(left), np.abs(right)),
     )
-    tolerance = 1024.0 * np.finfo(np.float64).eps * scale
+    tolerance = 1024.0 * np.finfo(np.float64).eps * elementwise_scale
     return bool(np.all(np.abs(left - right) <= tolerance))
 
 
@@ -331,6 +350,95 @@ class CorrelationDiagnostic:
     defined: bool
     value: float | None
     reason: str | None
+
+
+@dataclass(frozen=True, order=True)
+class BlasLibraryFingerprint:
+    internal_api: str
+    user_api: str
+    version: str
+    architecture: str
+    threading_layer: str
+    prefix: str
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"BLAS fingerprint {field.name} must be a non-empty string"
+                )
+
+
+@dataclass(frozen=True)
+class NumericalRuntimeFingerprint:
+    libraries: tuple[BlasLibraryFingerprint, ...]
+
+    def __post_init__(self) -> None:
+        libraries = tuple(self.libraries)
+        if not libraries or any(
+            not isinstance(library, BlasLibraryFingerprint) for library in libraries
+        ):
+            raise ValueError("numerical runtime must contain BLAS fingerprints")
+        if libraries != tuple(sorted(libraries)):
+            raise ValueError("BLAS fingerprints must be canonically sorted")
+        object.__setattr__(self, "libraries", libraries)
+
+
+def current_numerical_runtime_fingerprint() -> NumericalRuntimeFingerprint:
+    """Return stable loaded-BLAS identity while excluding paths/thread counts."""
+    libraries: list[BlasLibraryFingerprint] = []
+    for info in threadpool_info():
+        if info.get("user_api") != "blas":
+            continue
+        try:
+            values = {
+                field: info[field]
+                for field in (
+                    "internal_api",
+                    "user_api",
+                    "version",
+                    "architecture",
+                    "threading_layer",
+                    "prefix",
+                )
+            }
+            libraries.append(
+                BlasLibraryFingerprint(
+                    internal_api=values["internal_api"],
+                    user_api=values["user_api"],
+                    version=values["version"],
+                    architecture=values["architecture"],
+                    threading_layer=values["threading_layer"],
+                    prefix=values["prefix"],
+                )
+            )
+        except KeyError as error:
+            raise ValueError("loaded BLAS fingerprint is incomplete") from error
+    return NumericalRuntimeFingerprint(libraries=tuple(sorted(libraries)))
+
+
+def require_openblas_coretype(expected_core: str = "Haswell") -> str:
+    """Verify the official core pin was exported before Python/NumPy started."""
+    if not isinstance(expected_core, str) or not expected_core.strip():
+        raise ValueError("expected_core must be a non-empty string")
+    exported = os.environ.get("OPENBLAS_CORETYPE")
+    fingerprint = current_numerical_runtime_fingerprint()
+    openblas_libraries = tuple(
+        library
+        for library in fingerprint.libraries
+        if library.internal_api.casefold() == "openblas"
+    )
+    active_matches = bool(openblas_libraries) and all(
+        library.architecture.casefold() == expected_core.casefold()
+        for library in openblas_libraries
+    )
+    if exported != expected_core or not active_matches:
+        raise ValueError(
+            f"OPENBLAS_CORETYPE={expected_core} must be set before Python/NumPy "
+            "starts and match every loaded OpenBLAS core"
+        )
+    return expected_core
 
 
 @dataclass(frozen=True)
@@ -506,6 +614,7 @@ class FitResult:
     source_digest: str
     protocol_digest: str
     numerical_policy: str
+    numerical_runtime: NumericalRuntimeFingerprint
     labeled_hashes: tuple[str, ...]
     unlabeled_hashes: tuple[str, ...]
     test_hashes: tuple[str, ...]
@@ -541,6 +650,7 @@ class FitResult:
             "source_digest": self.source_digest,
             "protocol_digest": self.protocol_digest,
             "numerical_policy": self.numerical_policy,
+            "numerical_runtime": dataclasses.asdict(self.numerical_runtime),
             "labeled_hashes": list(self.labeled_hashes),
             "unlabeled_hashes": list(self.unlabeled_hashes),
             "test_hashes": list(self.test_hashes),
@@ -602,7 +712,7 @@ def canonical_fit_digest(result: FitResult) -> str:
     """Validate and hash the deterministic, hidden-label-free fit payload."""
     if not isinstance(result, FitResult):
         raise ValueError("result must be FitResult")
-    with threadpool_limits(limits=_BLAS_THREAD_LIMIT, user_api="blas"):
+    with _locked_blas_scope():
         _validate_fit_integrity(result)
     return _canonical_fit_digest_unchecked(result)
 
@@ -1046,6 +1156,7 @@ def _fit_task_single_thread(inputs: FitInputs, protocol: Protocol) -> FitResult:
         source_digest=inputs.source_digest,
         protocol_digest=canonical_protocol_digest(protocol),
         numerical_policy=NUMERICAL_POLICY,
+        numerical_runtime=current_numerical_runtime_fingerprint(),
         labeled_hashes=inputs.labeled_hashes,
         unlabeled_hashes=inputs.unlabeled_hashes,
         test_hashes=inputs.test_hashes,
@@ -1089,7 +1200,7 @@ def _fit_task_single_thread(inputs: FitInputs, protocol: Protocol) -> FitResult:
 
 def fit_task(inputs: FitInputs, protocol: Protocol) -> FitResult:
     """Fit all methods under the locked local single-BLAS-thread policy."""
-    with threadpool_limits(limits=_BLAS_THREAD_LIMIT, user_api="blas"):
+    with _locked_blas_scope():
         return _fit_task_single_thread(inputs, protocol)
 
 
@@ -1237,6 +1348,12 @@ def _validate_fit_integrity(fit: FitResult) -> None:
         raise ValueError("fit protocol_digest must be a lowercase SHA-256 digest")
     if fit.numerical_policy != NUMERICAL_POLICY:
         raise ValueError("fit numerical_policy does not match the locked BLAS policy")
+    if not isinstance(fit.numerical_runtime, NumericalRuntimeFingerprint):
+        raise ValueError("fit numerical_runtime must be a valid fingerprint")
+    try:
+        NumericalRuntimeFingerprint(libraries=fit.numerical_runtime.libraries)
+    except ValueError as error:
+        raise ValueError("fit numerical_runtime fingerprint is invalid") from error
     labeled_hashes = _hashes(fit.labeled_hashes, name="labeled_hashes")
     unlabeled_hashes = _hashes(fit.unlabeled_hashes, name="unlabeled_hashes")
     test_hashes = _hashes(fit.test_hashes, name="test_hashes")
@@ -1647,7 +1764,7 @@ def evaluate_task(
     expected_evaluation_digest: str,
 ) -> EvaluationResult:
     """Validate and evaluate under the locked single-BLAS-thread policy."""
-    with threadpool_limits(limits=_BLAS_THREAD_LIMIT, user_api="blas"):
+    with _locked_blas_scope():
         return _evaluate_task_single_thread(
             fit,
             labels,

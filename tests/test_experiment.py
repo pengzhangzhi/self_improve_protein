@@ -3,13 +3,18 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
 import pytest
 from numpy.typing import NDArray
 
+import self_improve_protein.experiment as experiment_module
 from self_improve_protein.config import Protocol, load_protocol
 from self_improve_protein.experiment import (
     NUMERICAL_POLICY,
@@ -24,8 +29,10 @@ from self_improve_protein.experiment import (
     canonical_fit_digest,
     canonical_protocol_digest,
     canonical_source_digest,
+    current_numerical_runtime_fingerprint,
     evaluate_task,
     fit_task,
+    require_openblas_coretype,
 )
 from self_improve_protein.provenance import derive_seed, sha256_bytes
 
@@ -159,6 +166,7 @@ def test_locked_blas_policy_is_cross_thread_digest_and_restart_portable(
 ) -> None:
     artifact_path = tmp_path / "fit.pkl"
     script = r"""
+import dataclasses
 import json
 import os
 import pickle
@@ -245,13 +253,16 @@ evaluation = evaluate_task(
     expected_evaluation_digest=evaluation_digest,
 )
 print(json.dumps({
+    "coefficients": [method.coefficients.tolist() for method in fit.methods],
     "digest": canonical_fit_digest(fit),
+    "predictions": [method.test_predictions.tolist() for method in fit.methods],
+    "runtime": dataclasses.asdict(fit.numerical_runtime),
     "selections": [list(method.selected_indices) for method in fit.methods],
     "spearman": [method.spearman for method in evaluation.methods],
 }, sort_keys=True))
 """
 
-    def run(action: str, threads: int) -> dict[str, object]:
+    def run(action: str, threads: int, core: str) -> dict[str, object]:
         environment = os.environ.copy()
         environment.update(
             ACTION=action,
@@ -259,6 +270,7 @@ print(json.dumps({
             OPENBLAS_NUM_THREADS=str(threads),
             OMP_NUM_THREADS=str(threads),
             MKL_NUM_THREADS=str(threads),
+            OPENBLAS_CORETYPE=core,
             PYTHONPATH=str(Path("src").resolve()),
         )
         completed = subprocess.run(
@@ -270,12 +282,38 @@ print(json.dumps({
         )
         return json.loads(completed.stdout.strip().splitlines()[-1])
 
-    fitted_under_eight = run("fit", 8)
-    independently_fitted_under_one = run("fresh", 1)
-    loaded_and_validated_under_one = run("validate", 1)
+    fitted_haswell_under_eight = run("fit", 8, "Haswell")
+    fresh_haswell_under_one = run("fresh", 1, "Haswell")
+    loaded_under_skylake = run("validate", 1, "SkylakeX")
+    fresh_skylake = run("fresh", 1, "SkylakeX")
 
-    assert fitted_under_eight == independently_fitted_under_one
-    assert fitted_under_eight == loaded_and_validated_under_one
+    assert fitted_haswell_under_eight == fresh_haswell_under_one
+    assert loaded_under_skylake["digest"] == fitted_haswell_under_eight["digest"]
+    assert loaded_under_skylake["runtime"] == fitted_haswell_under_eight["runtime"]
+    assert (
+        loaded_under_skylake["selections"] == fitted_haswell_under_eight["selections"]
+    )
+    assert fresh_skylake["runtime"] != fitted_haswell_under_eight["runtime"]
+    assert fresh_skylake["digest"] != fitted_haswell_under_eight["digest"]
+    assert fresh_skylake["selections"] == fitted_haswell_under_eight["selections"]
+    np.testing.assert_allclose(
+        fresh_skylake["coefficients"],
+        fitted_haswell_under_eight["coefficients"],
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        fresh_skylake["predictions"],
+        fitted_haswell_under_eight["predictions"],
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        fresh_skylake["spearman"],
+        fitted_haswell_under_eight["spearman"],
+        rtol=1e-12,
+        atol=1e-12,
+    )
 
 
 def test_fit_anchors_protocol_and_rejects_mismatched_source_identity() -> None:
@@ -289,6 +327,125 @@ def test_fit_anchors_protocol_and_rejects_mismatched_source_identity() -> None:
     assert fit.to_payload()["numerical_policy"] == NUMERICAL_POLICY
     with pytest.raises(ValueError, match="source_digest"):
         fit_task(dataclasses.replace(inputs, source_digest="b" * 64), protocol)
+
+
+def test_numerical_runtime_fingerprint_has_stable_nonpath_string_schema() -> None:
+    fingerprint = current_numerical_runtime_fingerprint()
+
+    assert fingerprint.libraries
+    for library in fingerprint.libraries:
+        assert all(
+            isinstance(value, str) and value for value in dataclasses.astuple(library)
+        )
+        assert not hasattr(library, "filepath")
+        assert not hasattr(library, "num_threads")
+
+
+def test_official_core_check_requires_prestarted_matching_openblas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_core = current_numerical_runtime_fingerprint().libraries[0].architecture
+    monkeypatch.setenv("OPENBLAS_CORETYPE", "NOT_THE_ACTIVE_CORE")
+    with pytest.raises(ValueError, match="before Python/NumPy starts"):
+        require_openblas_coretype("NOT_THE_ACTIVE_CORE")
+
+    monkeypatch.setenv("OPENBLAS_CORETYPE", active_core)
+    assert require_openblas_coretype(active_core) == active_core
+
+
+def test_elementwise_algebra_check_rejects_outlier_masked_sign_flip() -> None:
+    protocol, inputs, _ = _case()
+    fit = fit_task(inputs, protocol)
+    x_test = fit.x_test.copy()
+    reference_method = fit.methods[1]
+    nonzero_index = int(np.argmax(np.abs(reference_method.coefficients)))
+    x_test[0] = 0.0
+    x_test[0, nonzero_index] = 1.96e16 / reference_method.coefficients[nonzero_index]
+    outlier_methods = tuple(
+        dataclasses.replace(
+            method,
+            test_predictions=x_test @ method.coefficients,
+        )
+        for method in fit.methods
+    )
+    outlier_fit = dataclasses.replace(
+        fit,
+        x_test=x_test,
+        methods=outlier_methods,
+    )
+    canonical_fit_digest(outlier_fit)
+    changed_predictions = outlier_methods[1].test_predictions.copy()
+    changed_predictions[1:] *= -1.0
+    changed_methods = list(outlier_methods)
+    changed_methods[1] = dataclasses.replace(
+        outlier_methods[1],
+        test_predictions=changed_predictions,
+    )
+
+    with pytest.raises(ValueError, match="test predictions"):
+        canonical_fit_digest(
+            dataclasses.replace(outlier_fit, methods=tuple(changed_methods))
+        )
+
+
+def test_blas_scopes_serialize_and_restore_after_success_and_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protocol, inputs, _ = _case()
+    fit = fit_task(inputs, protocol)
+    invalid_fit = dataclasses.replace(fit, numerical_policy="invalid")
+    state_lock = threading.Lock()
+    state = {
+        "active": 0,
+        "maximum_active": 0,
+        "entered": 0,
+        "exited": 0,
+        "ambient_threads": 8,
+    }
+
+    @contextmanager
+    def fake_threadpool_limits(*, limits: int, user_api: str) -> object:
+        assert user_api == "blas"
+        with state_lock:
+            previous = state["ambient_threads"]
+            state["ambient_threads"] = limits
+            state["active"] += 1
+            state["entered"] += 1
+            state["maximum_active"] = max(
+                state["maximum_active"],
+                state["active"],
+            )
+        time.sleep(0.01)
+        try:
+            yield
+        finally:
+            time.sleep(0.005)
+            with state_lock:
+                state["active"] -= 1
+                state["exited"] += 1
+                state["ambient_threads"] = previous
+
+    monkeypatch.setattr(
+        experiment_module,
+        "threadpool_limits",
+        fake_threadpool_limits,
+    )
+
+    def validate(index: int) -> bool:
+        try:
+            canonical_fit_digest(fit if index % 2 == 0 else invalid_fit)
+        except ValueError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        outcomes = list(executor.map(validate, range(6)))
+
+    assert outcomes == [True, False, True, False, True, False]
+    assert state["maximum_active"] == 1
+    assert state["active"] == 0
+    assert state["entered"] == state["exited"] == 6
+    assert state["ambient_threads"] == 8
 
 
 def test_fit_inputs_excludes_hidden_labels_and_copies_arrays_read_only() -> None:

@@ -307,7 +307,7 @@ Expected: missing CLI and Slurm files.
 
 - [ ] **Step 3: Implement five idempotent commands and four stages**
 
-Commands: `prepare-data`, `embed-assay`, `run-task`, `aggregate`, and `verify`. Every command prints a normalized JSON start record, validates inputs, writes to a temporary sibling, validates output, atomically renames, and prints a terminal JSON record. The submit script submits prepare, embedding array, task array, and aggregate with `afterok` dependencies and records job IDs in an ignored local run directory.
+Commands: `prepare-data`, `embed-assay`, `run-task`, `aggregate`, and `verify`. Every command prints a normalized JSON start record, validates inputs, writes to a temporary sibling, validates output, atomically renames, and prints a terminal JSON record. Every official Slurm launcher must export `OPENBLAS_CORETYPE=Haswell` before Python/NumPy starts, call the active-core check, and record the numerical-runtime fingerprint. BLAS-scoped calls serialize within a process. The submit script submits prepare, embedding array, task array, and aggregate with `afterok` dependencies and records job IDs in an ignored local run directory.
 
 - [ ] **Step 4: Verify GREEN and shell syntax**
 
@@ -373,7 +373,7 @@ Submit one A100 smoke job for a small development-assay shard through `slurm/emb
 
 - [ ] **Step 4: Submit and monitor R5**
 
-Embed the full ninth eligible assay and run two full development seeds. Expected: 10 method rows total (five methods by two development seeds), finite teacher/score/prediction metrics, deterministic rerun hashes, and a written pilot note that does not enter v0 tables.
+Embed the full ninth eligible assay and run two full development seeds. Expected: 10 method rows total (five methods by two development seeds), finite teacher/score/prediction metrics, and a written pilot note that does not enter v0 tables. Reruns require exact hashes only under an identical numerical-runtime fingerprint; otherwise require identical discrete selections plus predeclared tight numerical equivalence while retaining distinct exact artifact hashes.
 
 - [ ] **Step 5: Classify failures at their lowest rung**
 

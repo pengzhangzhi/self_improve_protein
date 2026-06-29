@@ -34,7 +34,7 @@
 
 ## R4: Real Slurm launcher smoke
 
-**Check:** The actual Slurm path loads the frozen ESM model on one A100, embeds a small real sequence shard, atomically writes and reloads its cache, runs one reduced assay-seed task, emits metrics/diagnostics, and exits zero.
+**Check:** The actual Slurm path exports `OPENBLAS_CORETYPE=Haswell` before Python/NumPy starts, verifies and records the active numerical-runtime fingerprint, loads the frozen ESM model on one A100, embeds a small real sequence shard, atomically writes and reloads its cache, runs one reduced assay-seed task, emits metrics/diagnostics, and exits zero. BLAS-scoped calls serialize within a process.
 
 **Artifact:** `artifacts/verification/r4/` containing scheduler metadata, stdout/stderr, embedding metadata/checksum, one task result, and launcher exit report.
 
@@ -42,7 +42,7 @@
 
 ## R5: Development-only pilot
 
-**Check:** On the ninth eligible assay and two fixed development seeds, all four confirmatory methods plus the separately carded no-Hessian method complete at full task sizes; teacher and predictions vary; metrics and score diagnostics are finite; independent reruns match.
+**Check:** On the ninth eligible assay and two fixed development seeds, all four confirmatory methods plus the separately carded no-Hessian method complete at full task sizes; teacher and predictions vary; metrics and score diagnostics are finite; independent reruns match. Exact hashes are required only under an identical numerical-runtime fingerprint. If fingerprints differ, require identical discrete selections plus predeclared tight numerical equivalence and retain distinct exact artifact hashes.
 
 **Artifact:** `artifacts/verification/r5/` with the frozen development manifest, two task shards, aggregate table, and a pilot note.
 
