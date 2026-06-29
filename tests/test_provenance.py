@@ -72,17 +72,39 @@ def test_atomic_json_write_replaces_existing_file_without_temp_file(
     assert list(tmp_path.iterdir()) == [destination]
 
 
-def test_atomic_json_write_fsyncs_destination_local_temp_before_replace(
+def test_atomic_json_write_fsyncs_file_and_directory_around_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     destination = tmp_path / "nested" / "report.json"
     events: list[str] = []
+    directory_fds: set[int] = set()
+    directory_flags: list[int] = []
     replace_sources: list[Path] = []
+    real_open = provenance.os.open
     real_fsync = provenance.os.fsync
     real_replace = provenance.os.replace
+    real_close = provenance.os.close
+
+    def recording_open(
+        path: str | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        file_descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if Path(path) == destination.parent:
+            directory_fds.add(file_descriptor)
+            directory_flags.append(flags)
+        return file_descriptor
 
     def recording_fsync(file_descriptor: int) -> None:
-        events.append("fsync")
+        event = (
+            "directory_fsync"
+            if file_descriptor in directory_fds
+            else "file_fsync"
+        )
+        events.append(event)
         real_fsync(file_descriptor)
 
     def recording_replace(source: Path, target: Path) -> None:
@@ -90,14 +112,80 @@ def test_atomic_json_write_fsyncs_destination_local_temp_before_replace(
         replace_sources.append(Path(source))
         real_replace(source, target)
 
+    def recording_close(file_descriptor: int) -> None:
+        if file_descriptor in directory_fds:
+            events.append("close")
+        real_close(file_descriptor)
+
+    monkeypatch.setattr(provenance.os, "open", recording_open)
     monkeypatch.setattr(provenance.os, "fsync", recording_fsync)
     monkeypatch.setattr(provenance.os, "replace", recording_replace)
+    monkeypatch.setattr(provenance.os, "close", recording_close)
 
     atomic_write_json(destination, {"ready": True})
 
-    assert events == ["fsync", "replace"]
+    assert events == ["file_fsync", "replace", "directory_fsync", "close"]
     assert len(replace_sources) == 1
     assert replace_sources[0].parent == destination.parent
+    expected_flags = provenance.os.O_RDONLY | getattr(
+        provenance.os, "O_DIRECTORY", 0
+    )
+    assert directory_flags == [expected_flags]
+
+
+def test_atomic_json_write_closes_directory_after_directory_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "report.json"
+    destination.write_text('{"old": true}\n', encoding="utf-8")
+    events: list[str] = []
+    directory_fds: set[int] = set()
+    real_open = provenance.os.open
+    real_fsync = provenance.os.fsync
+    real_replace = provenance.os.replace
+    real_close = provenance.os.close
+
+    def recording_open(
+        path: str | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        file_descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if Path(path) == destination.parent:
+            directory_fds.add(file_descriptor)
+        return file_descriptor
+
+    def failing_directory_fsync(file_descriptor: int) -> None:
+        if file_descriptor in directory_fds:
+            events.append("directory_fsync")
+            raise OSError("simulated directory fsync failure")
+        events.append("file_fsync")
+        real_fsync(file_descriptor)
+
+    def recording_replace(source: Path, target: Path) -> None:
+        events.append("replace")
+        real_replace(source, target)
+
+    def recording_close(file_descriptor: int) -> None:
+        if file_descriptor in directory_fds:
+            events.append("close")
+        real_close(file_descriptor)
+
+    monkeypatch.setattr(provenance.os, "open", recording_open)
+    monkeypatch.setattr(provenance.os, "fsync", failing_directory_fsync)
+    monkeypatch.setattr(provenance.os, "replace", recording_replace)
+    monkeypatch.setattr(provenance.os, "close", recording_close)
+
+    with pytest.raises(OSError, match="simulated directory fsync failure"):
+        atomic_write_json(destination, {"replacement": True})
+
+    assert events == ["file_fsync", "replace", "directory_fsync", "close"]
+    assert json.loads(destination.read_text(encoding="utf-8")) == {
+        "replacement": True
+    }
+    assert list(tmp_path.iterdir()) == [destination]
 
 
 def test_atomic_json_write_cleans_destination_local_temp_after_replace_failure(

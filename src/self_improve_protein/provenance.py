@@ -29,6 +29,16 @@ def derive_seed(dms_id: str, seed: int, purpose: str) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Synchronize directory metadata and always close its descriptor."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    file_descriptor = os.open(directory, flags)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
 def atomic_write_json(path: Path | str, payload: object) -> None:
     """Serialize finite JSON and atomically replace *path* with the result."""
     serialized = json.dumps(
@@ -56,6 +66,7 @@ def atomic_write_json(path: Path | str, payload: object) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary_path, destination)
         temporary_path = None
+        _fsync_directory(destination.parent)
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

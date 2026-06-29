@@ -38,9 +38,6 @@ dev = [
     "types-PyYAML",
 ]
 
-[project.scripts]
-self-improve-protein = "self_improve_protein.cli:app"
-
 [tool.setuptools.packages.find]
 where = ["src"]
 

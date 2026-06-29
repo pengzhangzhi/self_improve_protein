@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,12 @@ CONFIG_PATH = Path("configs/v0.yaml")
 
 def _protocol_data() -> dict[str, object]:
     return load_protocol(CONFIG_PATH).model_dump(mode="python")
+
+
+def test_package_does_not_publish_console_script_before_cli_exists() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "scripts" not in pyproject["project"]
 
 
 def test_v0_protocol_has_all_locked_values() -> None:
@@ -64,6 +71,78 @@ def test_protocol_rejects_nonpositive_sizes(field: str) -> None:
         Protocol.model_validate(data)
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "working_size",
+        "n_labeled",
+        "n_unlabeled",
+        "n_test",
+        "q",
+        "assay_count",
+        "max_length",
+        "analysis_seed",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", [True, "1"])
+def test_protocol_rejects_coercible_integer_values(
+    field: str, invalid_value: object
+) -> None:
+    data = _protocol_data()
+    data[field] = invalid_value
+
+    with pytest.raises(ValidationError):
+        Protocol.model_validate(data)
+
+
+@pytest.mark.parametrize("field", ["pseudo_weight", "ridge_lambda", "damping"])
+@pytest.mark.parametrize("invalid_value", [True, "0.1"])
+def test_protocol_rejects_coercible_float_values(
+    field: str, invalid_value: object
+) -> None:
+    data = _protocol_data()
+    data[field] = invalid_value
+
+    with pytest.raises(ValidationError):
+        Protocol.model_validate(data)
+
+
+@pytest.mark.parametrize("field", ["pseudo_weight", "ridge_lambda", "damping"])
+@pytest.mark.parametrize(
+    "non_finite", [float("nan"), float("inf"), -float("inf")]
+)
+def test_protocol_rejects_non_finite_float_values(
+    field: str, non_finite: float
+) -> None:
+    data = _protocol_data()
+    data[field] = non_finite
+
+    with pytest.raises(ValidationError):
+        Protocol.model_validate(data)
+
+
+@pytest.mark.parametrize("invalid_value", [False, "0"])
+def test_preprocessing_rejects_coercible_label_ddof(invalid_value: object) -> None:
+    data = _protocol_data()
+    preprocessing = dict(data["preprocessing"])
+    preprocessing["label_ddof"] = invalid_value
+    data["preprocessing"] = preprocessing
+
+    with pytest.raises(ValidationError):
+        Protocol.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "seeds", [[True, 2, 3, 4, 5], [0, "5", 2, 3, 4]]
+)
+def test_protocol_rejects_coercible_seed_elements(seeds: list[object]) -> None:
+    data = _protocol_data()
+    data["seeds"] = seeds
+
+    with pytest.raises(ValidationError):
+        Protocol.model_validate(data)
+
+
 def test_protocol_rejects_active_sizes_exceeding_working_size() -> None:
     data = _protocol_data()
     data["n_test"] = 4000
@@ -104,3 +183,29 @@ def test_protocol_is_immutable() -> None:
 
     with pytest.raises(ValidationError, match="frozen"):
         protocol.preprocessing.label_ddof = 1
+
+
+def test_load_protocol_rejects_duplicate_top_level_keys(tmp_path: Path) -> None:
+    duplicate = tmp_path / "duplicate-top-level.yaml"
+    duplicate.write_text(
+        CONFIG_PATH.read_text(encoding="utf-8") + "q: 191\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"duplicate key 'q'"):
+        load_protocol(duplicate)
+
+
+def test_load_protocol_rejects_duplicate_nested_keys(tmp_path: Path) -> None:
+    duplicate = tmp_path / "duplicate-nested.yaml"
+    config_text = CONFIG_PATH.read_text(encoding="utf-8")
+    duplicate.write_text(
+        config_text.replace(
+            "  label_ddof: 0\n",
+            "  label_ddof: 0\n  label_ddof: 0\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"duplicate key 'label_ddof'"):
+        load_protocol(duplicate)
