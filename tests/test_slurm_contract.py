@@ -243,6 +243,67 @@ def test_confirmatory_submit_requires_passed_r5_gate_before_any_sbatch(
     assert not (repo / "local" / "slurm" / "test-run").exists()
 
 
+def test_confirmatory_submit_validates_bound_pilot_root_not_output_root(
+    tmp_path: Path,
+) -> None:
+    env, repo, calls_path = _mock_submit_environment(tmp_path)
+    pilot_results = tmp_path / "r5-results"
+    confirmatory_results = tmp_path / "r6-results"
+    aggregate = tmp_path / "r5-aggregate.json"
+    pilot_note = tmp_path / "r5-pilot-note.json"
+    gate = tmp_path / "r5-gate.json"
+    gate_payload = {
+        "aggregate": {"path": str(aggregate.resolve())},
+        "pilot_note": {"path": str(pilot_note.resolve())},
+        "pilot_results_root": str(pilot_results.resolve()),
+    }
+    gate.write_text(json.dumps(gate_payload), encoding="utf-8")
+    validator = repo / ".venv" / "bin" / "self-improve-protein"
+    source_root = (Path.cwd() / "src").absolute()
+    validator.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(source_root)!r})\n"
+        "import self_improve_protein.cli as cli\n"
+        "args = sys.argv[1:]\n"
+        "gate = Path(args[args.index('--r5-gate') + 1])\n"
+        "output_root = Path(args[args.index('--results-root') + 1])\n"
+        "actual = json.loads(gate.read_text(encoding='utf-8'))\n"
+        "def rebuild(**kwargs):\n"
+        "    if kwargs['results_root'] != Path(actual['pilot_results_root']):\n"
+        "        raise ValueError('used confirmatory output root for R5 evidence')\n"
+        "    return actual\n"
+        "cli._build_r5_gate_payload = rebuild\n"
+        "cli._validated_r5_gate_digest(\n"
+        "    gate, protocol=None, manifest=None, manifest_path=Path('/manifest'),\n"
+        "    processed_root=Path('/processed'), embedding_root=Path('/embeddings'),\n"
+        "    results_root=output_root,\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    validator.chmod(0o755)
+    env.update(
+        SI_MODE="confirmatory",
+        SI_R5_GATE=str(gate),
+        SI_RESULTS_ROOT=str(confirmatory_results),
+    )
+    script = (SLURM / "submit_pipeline.sh").resolve()
+
+    completed = subprocess.run(
+        ["bash", str(script)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert pilot_results != confirmatory_results
+    assert len(calls_path.read_text(encoding="utf-8").splitlines()) == 4
+
+
 def test_forged_field_only_r5_gate_without_evidence_submits_no_jobs(
     tmp_path: Path,
 ) -> None:

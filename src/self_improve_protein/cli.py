@@ -1507,6 +1507,7 @@ def _build_r5_gate_payload(
         "method_row_count": 10,
         "numerical_runtime": execution["numerical_runtime"],
         "pilot_note": pilot_note,
+        "pilot_results_root": str(results_root.resolve()),
         "protocol_digest": provenance["protocol_digest"],
         "schema_version": 1,
         "status": "passed",
@@ -1530,11 +1531,13 @@ def _validated_r5_gate_digest(
     actual = _load_unique_json(gate_path)
     aggregate = actual.get("aggregate")
     pilot_note = actual.get("pilot_note")
+    pilot_results_root_raw = actual.get("pilot_results_root")
     if (
         not isinstance(aggregate, dict)
         or not isinstance(aggregate.get("path"), str)
         or not isinstance(pilot_note, dict)
         or not isinstance(pilot_note.get("path"), str)
+        or not isinstance(pilot_results_root_raw, str)
     ):
         raise ValueError("R5 gate does not identify its aggregate evidence")
     aggregate_path = Path(cast(str, aggregate["path"]))
@@ -1543,13 +1546,19 @@ def _validated_r5_gate_digest(
     pilot_note_path = Path(cast(str, pilot_note["path"]))
     if not pilot_note_path.is_absolute():
         raise ValueError("R5 pilot note path must be absolute")
+    pilot_results_root = Path(pilot_results_root_raw)
+    if (
+        not pilot_results_root.is_absolute()
+        or pilot_results_root.resolve() != pilot_results_root
+    ):
+        raise ValueError("R5 pilot results root must be canonical and absolute")
     expected = _build_r5_gate_payload(
         protocol=protocol,
         manifest=manifest,
         manifest_path=manifest_path,
         processed_root=processed_root,
         embedding_root=embedding_root,
-        results_root=results_root,
+        results_root=pilot_results_root,
         aggregate_artifact=aggregate_path,
         pilot_note_path=pilot_note_path,
     )

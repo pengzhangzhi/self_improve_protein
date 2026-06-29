@@ -883,18 +883,107 @@ def test_r5_gate_is_written_only_from_reconstructed_two_seed_evidence(
     assert [entry["seed"] for entry in gate["task_manifest"]] == [0, 1]
     assert gate["pilot_note"]["path"] == str(pilot_note.resolve())
     assert gate["pilot_note"]["sha256"] == cli_module.sha256_file(pilot_note)
+    assert gate["pilot_results_root"] == str(paths["results"].resolve())
+    original_gate_bytes = gate_path.read_bytes()
+    repeated_gate = RUNNER.invoke(app, verify_args)
+    assert repeated_gate.exit_code == 0, repeated_gate.output
+    assert gate_path.read_bytes() == original_gate_bytes
+    substituted_gate = {**gate, "pilot_results_root": str(tmp_path.resolve())}
+    gate_path.write_text(json.dumps(substituted_gate), encoding="utf-8")
+    rejected_substitution = RUNNER.invoke(
+        app,
+        [
+            "--config",
+            str(paths["config"]),
+            "verify",
+            "--manifest",
+            str(paths["manifest"]),
+            "--processed-root",
+            str(paths["processed"]),
+            "--embedding-root",
+            str(paths["embeddings"]),
+            "--results-root",
+            str(tmp_path / "confirmatory-results"),
+            "--r5-gate",
+            str(gate_path),
+        ],
+    )
+    assert rejected_substitution.exit_code != 0
+    gate_path.write_bytes(original_gate_bytes)
+    confirmatory_results = tmp_path / "confirmatory-results"
     confirmatory_args = first_args.copy()
     confirmatory_args[confirmatory_args.index("BBB")] = "AAA"
     confirmatory_args[confirmatory_args.index("development")] = "confirmatory"
+    confirmatory_args[
+        confirmatory_args.index(str(paths["results"]))
+    ] = str(confirmatory_results)
     confirmatory_args.extend(("--r5-gate", str(gate_path)))
     confirmatory = RUNNER.invoke(app, confirmatory_args)
     assert confirmatory.exit_code == 0, confirmatory.output
+    second_confirmatory_args = confirmatory_args.copy()
+    second_confirmatory_args[second_confirmatory_args.index("0")] = "1"
+    second_confirmatory = RUNNER.invoke(app, second_confirmatory_args)
+    assert second_confirmatory.exit_code == 0, second_confirmatory.output
     confirmatory_task = json.loads(
-        (paths["results"] / "tasks" / "AAA" / "seed_0.json").read_text(encoding="utf-8")
+        (confirmatory_results / "tasks" / "AAA" / "seed_0.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert confirmatory_task["provenance"]["r5_gate_sha256"] == (
         cli_module.sha256_file(gate_path)
     )
+    monkeypatch.setattr(
+        cli_module,
+        "v0_analysis_verdict",
+        lambda _results: {"status": "synthetic_confirmatory_test"},
+    )
+    confirmatory_aggregate_path = tmp_path / "confirmatory-aggregate.json"
+    confirmatory_aggregate = RUNNER.invoke(
+        app,
+        [
+            "--config",
+            str(paths["config"]),
+            "aggregate",
+            "--manifest",
+            str(paths["manifest"]),
+            "--processed-root",
+            str(paths["processed"]),
+            "--embedding-root",
+            str(paths["embeddings"]),
+            "--results-root",
+            str(confirmatory_results),
+            "--output",
+            str(confirmatory_aggregate_path),
+            "--mode",
+            "confirmatory",
+            "--r5-gate",
+            str(gate_path),
+        ],
+    )
+    assert confirmatory_aggregate.exit_code == 0, confirmatory_aggregate.output
+    verified_confirmatory = RUNNER.invoke(
+        app,
+        [
+            "--config",
+            str(paths["config"]),
+            "verify",
+            "--manifest",
+            str(paths["manifest"]),
+            "--processed-root",
+            str(paths["processed"]),
+            "--embedding-root",
+            str(paths["embeddings"]),
+            "--results-root",
+            str(confirmatory_results),
+            "--task-artifact",
+            str(confirmatory_results / "tasks" / "AAA" / "seed_0.json"),
+            "--aggregate-artifact",
+            str(confirmatory_aggregate_path),
+            "--r5-gate",
+            str(gate_path),
+        ],
+    )
+    assert verified_confirmatory.exit_code == 0, verified_confirmatory.output
     pilot_note.write_text("{}\n", encoding="utf-8")
     mutated_note = RUNNER.invoke(
         app,
@@ -909,7 +998,7 @@ def test_r5_gate_is_written_only_from_reconstructed_two_seed_evidence(
             "--embedding-root",
             str(paths["embeddings"]),
             "--results-root",
-            str(paths["results"]),
+            str(confirmatory_results),
             "--r5-gate",
             str(gate_path),
         ],
@@ -934,7 +1023,7 @@ def test_r5_gate_is_written_only_from_reconstructed_two_seed_evidence(
             "--embedding-root",
             str(paths["embeddings"]),
             "--results-root",
-            str(paths["results"]),
+            str(confirmatory_results),
             "--r5-gate",
             str(gate_path),
         ],
