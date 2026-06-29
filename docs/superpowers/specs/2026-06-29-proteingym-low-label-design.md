@@ -151,7 +151,7 @@ This rule decides the **selection hypothesis**. A separate **practical self-impr
 
 ### Required diagnostics
 
-Save teacher test Spearman; score min/max/standard deviation/quantiles/positive fraction/unique count; mean selected score for ours and random; overlap with top-teacher; hidden unlabeled pseudo-label absolute error for analysis only; teacher-student residual distributions; Hessian eigenvalue spectrum, numerical effective rank, condition number, and effective ridge degrees of freedom; \(\lVert g_L+\lambda\theta_0\rVert\); selection hashes; and random-selection Monte Carlo sensitivity.
+Save teacher test Spearman; score min/max/standard deviation/quantiles/positive fraction/unique count; mean selected score for ours and random; overlap with top-teacher; hidden unlabeled pseudo-label absolute error for analysis only; teacher-student residual distributions; regularized-Hessian eigenvalue spectrum and condition number; unregularized weighted-data numerical rank; effective ridge degrees of freedom; \(\lVert g_L+\lambda\theta_0\rVert\); selection hashes; and random-selection Monte Carlo sensitivity. All fit, integrity, and evaluation linear algebra runs inside the recorded `threadpoolctl:blas_threads=1` policy so restart nodes and ambient BLAS settings cannot change artifact bytes.
 
 After predictions and selection hashes are frozen, compute an analysis-only oracle influence score by replacing the labeled outer gradient with the test gradient. Report its rank correlation with the proposed score and the \((H+\rho I)^{-1}\)-metric cosine between labeled and test gradients. These diagnostics explain proxy alignment but never enter selection.
 

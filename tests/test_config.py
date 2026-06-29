@@ -32,6 +32,19 @@ def test_random_selection_environment_exactly_pins_numpy() -> None:
     assert numpy_versions == {"2.3.5"}
 
 
+def test_blas_runtime_policy_exactly_pins_threadpoolctl() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    lockfile = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+
+    assert "threadpoolctl==3.6.0" in pyproject["project"]["dependencies"]
+    versions = {
+        package["version"]
+        for package in lockfile["package"]
+        if package["name"] == "threadpoolctl"
+    }
+    assert versions == {"3.6.0"}
+
+
 def test_embedding_environment_exactly_pins_torch_and_transformers() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     lockfile = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))

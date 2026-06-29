@@ -11,6 +11,7 @@ from typing import Literal, TypeAlias
 
 import numpy as np
 from numpy.typing import NDArray
+from threadpoolctl import threadpool_limits  # type: ignore[import-untyped]
 
 from self_improve_protein.config import Protocol
 from self_improve_protein.metrics import (
@@ -55,6 +56,8 @@ METHOD_NAMES: tuple[MethodName, ...] = (
     "no_hessian",
 )
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_BLAS_THREAD_LIMIT = 1
+NUMERICAL_POLICY = "threadpoolctl:blas_threads=1"
 _SOURCE_IDENTITY_FIELDS = (
     "data_release",
     "substitutions_url",
@@ -165,6 +168,44 @@ def _constant(vector: FloatArray) -> bool:
         )
     )
     return bool(span <= tolerance)
+
+
+def _scaled_algebra_close(first: object, second: object) -> bool:
+    """Compare recomputed floating algebra at a strict scale-aware tolerance."""
+    try:
+        left = np.asarray(first, dtype=np.float64)
+        right = np.asarray(second, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False
+    if left.shape != right.shape:
+        return False
+    if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+        return False
+    scale = max(
+        1.0,
+        float(np.max(np.abs(left))) if left.size else 0.0,
+        float(np.max(np.abs(right))) if right.size else 0.0,
+    )
+    tolerance = 1024.0 * np.finfo(np.float64).eps * scale
+    return bool(np.all(np.abs(left - right) <= tolerance))
+
+
+def _diagnostic_values_close(first: object, second: object) -> bool:
+    if isinstance(first, dict) and isinstance(second, dict):
+        return first.keys() == second.keys() and all(
+            _diagnostic_values_close(first[key], second[key]) for key in first
+        )
+    if isinstance(first, (tuple, list)) and isinstance(second, (tuple, list)):
+        return len(first) == len(second) and all(
+            _diagnostic_values_close(left, right)
+            for left, right in zip(first, second, strict=True)
+        )
+    if isinstance(first, (float, np.floating)) and isinstance(
+        second,
+        (float, np.floating),
+    ):
+        return _scaled_algebra_close(first, second)
+    return bool(first == second)
 
 
 @dataclass(frozen=True)
@@ -336,7 +377,7 @@ class NormalMatrixDiagnostics:
     minimum_eigenvalue: float
     maximum_eigenvalue: float
     condition_number: float
-    numerical_rank: int
+    data_numerical_rank: int
     effective_df: float
     spectrum: tuple[float, ...]
 
@@ -464,6 +505,7 @@ class FitResult:
     seed: int
     source_digest: str
     protocol_digest: str
+    numerical_policy: str
     labeled_hashes: tuple[str, ...]
     unlabeled_hashes: tuple[str, ...]
     test_hashes: tuple[str, ...]
@@ -498,6 +540,7 @@ class FitResult:
             "seed": self.seed,
             "source_digest": self.source_digest,
             "protocol_digest": self.protocol_digest,
+            "numerical_policy": self.numerical_policy,
             "labeled_hashes": list(self.labeled_hashes),
             "unlabeled_hashes": list(self.unlabeled_hashes),
             "test_hashes": list(self.test_hashes),
@@ -559,7 +602,8 @@ def canonical_fit_digest(result: FitResult) -> str:
     """Validate and hash the deterministic, hidden-label-free fit payload."""
     if not isinstance(result, FitResult):
         raise ValueError("result must be FitResult")
-    _validate_fit_integrity(result)
+    with threadpool_limits(limits=_BLAS_THREAD_LIMIT, user_api="blas"):
+        _validate_fit_integrity(result)
     return _canonical_fit_digest_unchecked(result)
 
 
@@ -597,14 +641,13 @@ def _matrix_diagnostics(
     normal = data_gram + ridge_lambda * np.eye(x.shape[1])
     eigenvalues = np.linalg.eigvalsh(normal)
     data_eigenvalues = np.linalg.eigvalsh(data_gram)
-    tolerance = (
-        max(normal.shape) * np.finfo(np.float64).eps * float(np.max(eigenvalues))
-    )
+    largest_data_eigenvalue = max(float(np.max(data_eigenvalues)), 0.0)
+    data_tolerance = max(x.shape) * np.finfo(np.float64).eps * largest_data_eigenvalue
     return NormalMatrixDiagnostics(
         minimum_eigenvalue=float(eigenvalues[0]),
         maximum_eigenvalue=float(eigenvalues[-1]),
         condition_number=float(eigenvalues[-1] / eigenvalues[0]),
-        numerical_rank=int(np.count_nonzero(eigenvalues > tolerance)),
+        data_numerical_rank=int(np.count_nonzero(data_eigenvalues > data_tolerance)),
         effective_df=float(
             np.sum(data_eigenvalues / (data_eigenvalues + ridge_lambda))
         ),
@@ -845,8 +888,7 @@ def _validate_against_protocol(inputs: FitInputs, protocol: Protocol) -> None:
         )
 
 
-def fit_task(inputs: FitInputs, protocol: Protocol) -> FitResult:
-    """Fit all locked methods without accepting or accessing hidden labels."""
+def _fit_task_single_thread(inputs: FitInputs, protocol: Protocol) -> FitResult:
     if not isinstance(inputs, FitInputs):
         raise ValueError("inputs must be FitInputs")
     if not isinstance(protocol, Protocol):
@@ -1003,6 +1045,7 @@ def fit_task(inputs: FitInputs, protocol: Protocol) -> FitResult:
         seed=inputs.seed,
         source_digest=inputs.source_digest,
         protocol_digest=canonical_protocol_digest(protocol),
+        numerical_policy=NUMERICAL_POLICY,
         labeled_hashes=inputs.labeled_hashes,
         unlabeled_hashes=inputs.unlabeled_hashes,
         test_hashes=inputs.test_hashes,
@@ -1042,6 +1085,12 @@ def fit_task(inputs: FitInputs, protocol: Protocol) -> FitResult:
         methods=tuple(methods),
         diagnostics=diagnostics,
     )
+
+
+def fit_task(inputs: FitInputs, protocol: Protocol) -> FitResult:
+    """Fit all methods under the locked local single-BLAS-thread policy."""
+    with threadpool_limits(limits=_BLAS_THREAD_LIMIT, user_api="blas"):
+        return _fit_task_single_thread(inputs, protocol)
 
 
 @dataclass(frozen=True)
@@ -1186,6 +1235,8 @@ def _validate_fit_integrity(fit: FitResult) -> None:
         fit.protocol_digest
     ):
         raise ValueError("fit protocol_digest must be a lowercase SHA-256 digest")
+    if fit.numerical_policy != NUMERICAL_POLICY:
+        raise ValueError("fit numerical_policy does not match the locked BLAS policy")
     labeled_hashes = _hashes(fit.labeled_hashes, name="labeled_hashes")
     unlabeled_hashes = _hashes(fit.unlabeled_hashes, name="unlabeled_hashes")
     test_hashes = _hashes(fit.test_hashes, name="test_hashes")
@@ -1238,40 +1289,32 @@ def _validate_fit_integrity(fit: FitResult) -> None:
         fit.y_l_raw,
         ddof=fit.label_transform.ddof,
     )
-    if not np.isclose(
+    if not _scaled_algebra_close(
         fit.label_transform.mean,
         expected_label_transform.mean,
-        atol=0.0,
-        rtol=0.0,
-    ) or not np.isclose(
+    ) or not _scaled_algebra_close(
         fit.label_transform.scale,
         expected_label_transform.scale,
-        atol=0.0,
-        rtol=0.0,
     ):
         raise ValueError("fit label transform is inconsistent with labeled outcomes")
-    if not np.array_equal(
+    if not _scaled_algebra_close(
         fit.y_l_standardized,
         fit.label_transform.transform(fit.y_l_raw),
     ):
         raise ValueError("fit standardized labeled outcomes are inconsistent")
     expected_calibration = fit_teacher_calibration(fit.z_l, fit.y_l_standardized)
-    if not np.isclose(
+    if not _scaled_algebra_close(
         fit.teacher_calibration.slope,
         expected_calibration.slope,
-        atol=0.0,
-        rtol=0.0,
-    ) or not np.isclose(
+    ) or not _scaled_algebra_close(
         fit.teacher_calibration.intercept,
         expected_calibration.intercept,
-        atol=0.0,
-        rtol=0.0,
     ):
         raise ValueError("fit teacher calibration is inconsistent with labeled data")
-    if not np.array_equal(
+    if not _scaled_algebra_close(
         fit.pseudo_labels_u,
         fit.teacher_calibration.predict(fit.z_u),
-    ) or not np.array_equal(
+    ) or not _scaled_algebra_close(
         fit.teacher_predictions_test,
         fit.teacher_calibration.predict(fit.z_test),
     ):
@@ -1298,7 +1341,10 @@ def _validate_fit_integrity(fit: FitResult) -> None:
         theta_zero,
         fit.ridge_lambda,
     )
-    if not np.array_equal(fit.full_scores, expected_full_scores) or not np.array_equal(
+    if not _scaled_algebra_close(
+        fit.full_scores,
+        expected_full_scores,
+    ) or not _scaled_algebra_close(
         fit.no_hessian_scores,
         expected_no_h_scores,
     ):
@@ -1371,7 +1417,7 @@ def _validate_fit_integrity(fit: FitResult) -> None:
         if method.coefficients.size != fit.x_l.shape[1]:
             raise ValueError(f"{method.name} coefficient width mismatch")
         expected_predictions = fit.x_test @ method.coefficients
-        if not np.array_equal(method.test_predictions, expected_predictions):
+        if not _scaled_algebra_close(method.test_predictions, expected_predictions):
             raise ValueError(f"{method.name} test predictions are inconsistent")
         if _constant(method.test_predictions):
             raise ValueError(f"{method.name} produced a constant primary prediction")
@@ -1456,26 +1502,31 @@ def _validate_fit_integrity(fit: FitResult) -> None:
         pseudo_weight=fit.pseudo_weight,
         ridge_lambda=fit.ridge_lambda,
     )
+    actual_diagnostics = dataclasses.asdict(fit.diagnostics)
+    expected_diagnostics_payload = dataclasses.asdict(expected_diagnostics)
     try:
-        actual_diagnostics = json.dumps(
-            dataclasses.asdict(fit.diagnostics),
+        json.dumps(
+            actual_diagnostics,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
         )
-        expected_diagnostics_payload = json.dumps(
-            dataclasses.asdict(expected_diagnostics),
+        json.dumps(
+            expected_diagnostics_payload,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
         )
     except (TypeError, ValueError) as error:
         raise ValueError("fit diagnostics must contain only finite values") from error
-    if actual_diagnostics != expected_diagnostics_payload:
+    if not _diagnostic_values_close(
+        actual_diagnostics,
+        expected_diagnostics_payload,
+    ):
         raise ValueError("fit diagnostics do not match recomputed diagnostics")
 
 
-def evaluate_task(
+def _evaluate_task_single_thread(
     fit: FitResult,
     labels: EvaluationLabels,
     *,
@@ -1585,3 +1636,22 @@ def evaluate_task(
             gradient_cosine_defined=no_h_cosine_defined,
         ),
     )
+
+
+def evaluate_task(
+    fit: FitResult,
+    labels: EvaluationLabels,
+    *,
+    protocol: Protocol,
+    expected_fit_digest: str,
+    expected_evaluation_digest: str,
+) -> EvaluationResult:
+    """Validate and evaluate under the locked single-BLAS-thread policy."""
+    with threadpool_limits(limits=_BLAS_THREAD_LIMIT, user_api="blas"):
+        return _evaluate_task_single_thread(
+            fit,
+            labels,
+            protocol=protocol,
+            expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
+        )

@@ -22,4 +22,4 @@
 
 **Start rung:** Reuse v0 R1-R4 only after the no-Hessian explicit/vectorized parity test passes.
 
-**Exploratory-only:** Relationships with Hessian spectrum, numerical effective rank, teacher quality, oracle-gradient alignment, and PCA dimension. These may explain the result but cannot change its success rule.
+**Exploratory-only:** Relationships with Hessian spectrum, unregularized weighted-data numerical rank, teacher quality, oracle-gradient alignment, and PCA dimension. These may explain the result but cannot change its success rule.

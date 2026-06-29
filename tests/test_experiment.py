@@ -1,5 +1,8 @@
 import dataclasses
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -9,12 +12,14 @@ from numpy.typing import NDArray
 
 from self_improve_protein.config import Protocol, load_protocol
 from self_improve_protein.experiment import (
+    NUMERICAL_POLICY,
     EvaluationLabels,
     EvaluationResult,
     FitInputs,
     FitResult,
     MethodArtifact,
     _cosine_diagnostic,
+    _matrix_diagnostics,
     canonical_evaluation_digest,
     canonical_fit_digest,
     canonical_protocol_digest,
@@ -149,13 +154,139 @@ def test_evaluation_digest_binds_identity_hash_order_and_hidden_label_bytes() ->
     )
 
 
+def test_locked_blas_policy_is_cross_thread_digest_and_restart_portable(
+    tmp_path: Path,
+) -> None:
+    artifact_path = tmp_path / "fit.pkl"
+    script = r"""
+import json
+import os
+import pickle
+from pathlib import Path
+
+import numpy as np
+
+from self_improve_protein.config import Protocol, load_protocol
+from self_improve_protein.experiment import (
+    EvaluationLabels,
+    FitInputs,
+    canonical_evaluation_digest,
+    canonical_fit_digest,
+    canonical_source_digest,
+    evaluate_task,
+    fit_task,
+)
+from self_improve_protein.provenance import sha256_bytes
+
+path = Path(os.environ["ARTIFACT_PATH"])
+action = os.environ["ACTION"]
+if action == "validate":
+    with path.open("rb") as handle:
+        fit, labels, protocol, fit_digest, evaluation_digest = pickle.load(handle)
+else:
+    data = load_protocol("configs/v0.yaml").model_dump(mode="python")
+    data.update(
+        working_size=388,
+        n_labeled=96,
+        n_unlabeled=192,
+        n_test=100,
+        q=32,
+        random_diagnostic_replicates=3,
+    )
+    protocol = Protocol.model_validate(data)
+    rng = np.random.Generator(np.random.PCG64(86420))
+    width = 480
+    x_l = rng.normal(size=(protocol.n_labeled, width))
+    x_u = rng.normal(size=(protocol.n_unlabeled, width))
+    x_test = rng.normal(size=(protocol.n_test, width))
+    y_l = rng.normal(size=protocol.n_labeled)
+    y_u = rng.normal(size=protocol.n_unlabeled)
+    y_test = rng.normal(size=protocol.n_test)
+    z_l = rng.normal(size=protocol.n_labeled)
+    z_u = rng.normal(size=protocol.n_unlabeled)
+    z_test = rng.normal(size=protocol.n_test)
+    hashes = lambda prefix, count: tuple(
+        sha256_bytes(f"{prefix}:{index}".encode()) for index in range(count)
+    )
+    common = dict(
+        assay_id="THREAD_PORTABLE",
+        seed=2,
+        source_digest=canonical_source_digest(protocol),
+        labeled_hashes=hashes("l", protocol.n_labeled),
+        unlabeled_hashes=hashes("u", protocol.n_unlabeled),
+        test_hashes=hashes("t", protocol.n_test),
+    )
+    inputs = FitInputs(
+        **common,
+        x_l=x_l,
+        y_l=y_l,
+        z_l=z_l,
+        x_u=x_u,
+        z_u=z_u,
+        x_test=x_test,
+        z_test=z_test,
+    )
+    labels = EvaluationLabels(**common, y_u=y_u, y_test=y_test)
+    fit = fit_task(inputs, protocol)
+    fit_digest = canonical_fit_digest(fit)
+    evaluation_digest = canonical_evaluation_digest(labels)
+    if action == "fit":
+        with path.open("wb") as handle:
+            pickle.dump(
+                (fit, labels, protocol, fit_digest, evaluation_digest),
+                handle,
+            )
+
+evaluation = evaluate_task(
+    fit,
+    labels,
+    protocol=protocol,
+    expected_fit_digest=fit_digest,
+    expected_evaluation_digest=evaluation_digest,
+)
+print(json.dumps({
+    "digest": canonical_fit_digest(fit),
+    "selections": [list(method.selected_indices) for method in fit.methods],
+    "spearman": [method.spearman for method in evaluation.methods],
+}, sort_keys=True))
+"""
+
+    def run(action: str, threads: int) -> dict[str, object]:
+        environment = os.environ.copy()
+        environment.update(
+            ACTION=action,
+            ARTIFACT_PATH=str(artifact_path),
+            OPENBLAS_NUM_THREADS=str(threads),
+            OMP_NUM_THREADS=str(threads),
+            MKL_NUM_THREADS=str(threads),
+            PYTHONPATH=str(Path("src").resolve()),
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+
+    fitted_under_eight = run("fit", 8)
+    independently_fitted_under_one = run("fresh", 1)
+    loaded_and_validated_under_one = run("validate", 1)
+
+    assert fitted_under_eight == independently_fitted_under_one
+    assert fitted_under_eight == loaded_and_validated_under_one
+
+
 def test_fit_anchors_protocol_and_rejects_mismatched_source_identity() -> None:
     protocol, inputs, _ = _case()
     fit = fit_task(inputs, protocol)
 
     assert fit.protocol_digest == canonical_protocol_digest(protocol)
     assert fit.source_digest == canonical_source_digest(protocol)
+    assert fit.numerical_policy == NUMERICAL_POLICY
     assert fit.to_payload()["protocol_digest"] == fit.protocol_digest
+    assert fit.to_payload()["numerical_policy"] == NUMERICAL_POLICY
     with pytest.raises(ValueError, match="source_digest"):
         fit_task(dataclasses.replace(inputs, source_digest="b" * 64), protocol)
 
@@ -342,6 +473,8 @@ def test_fit_diagnostics_are_finite_and_cover_scores_geometry_and_locality() -> 
     for method in diagnostics.methods:
         assert np.isfinite(method.stationarity_residual)
         assert np.isfinite(method.normal_matrix.condition_number)
+        assert method.normal_matrix.data_numerical_rank <= inputs.x_l.shape[1]
+        assert not hasattr(method.normal_matrix, "numerical_rank")
         assert 0.0 <= method.normal_matrix.effective_df <= inputs.x_l.shape[1]
         if method.name != "supervised":
             assert np.isfinite(method.first_order_labeled_loss_change)
@@ -350,6 +483,17 @@ def test_fit_diagnostics_are_finite_and_cover_scores_geometry_and_locality() -> 
             assert np.isfinite(method.displacement_cosine)
             assert np.isfinite(method.displacement_relative_error)
             assert np.isfinite(method.locality_index)
+
+
+def test_data_rank_uses_unregularized_centered_design_when_p_exceeds_n() -> None:
+    rng = np.random.Generator(np.random.PCG64(48096))
+    x = rng.normal(size=(96, 480))
+    x -= x.mean(axis=0)
+    diagnostics = _matrix_diagnostics(x, np.ones(96), ridge_lambda=0.01)
+
+    assert diagnostics.data_numerical_rank <= 95
+    assert diagnostics.minimum_eigenvalue > 0.0
+    assert diagnostics.effective_df <= diagnostics.data_numerical_rank
 
 
 def test_evaluate_task_hidden_diagnostics_do_not_mutate_fit() -> None:
