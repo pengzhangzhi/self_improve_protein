@@ -439,6 +439,25 @@ def _array_identity(array: FloatArray) -> dict[str, object]:
     }
 
 
+def canonical_evaluation_digest(labels: EvaluationLabels) -> str:
+    """Bind hidden outcomes to their verified task and ordered split identity."""
+    if not isinstance(labels, EvaluationLabels):
+        raise ValueError("labels must be EvaluationLabels")
+    payload = {
+        "assay_id": labels.assay_id,
+        "seed": labels.seed,
+        "source_digest": labels.source_digest,
+        "labeled_hashes": list(labels.labeled_hashes),
+        "unlabeled_hashes": list(labels.unlabeled_hashes),
+        "test_hashes": list(labels.test_hashes),
+        "hidden_outcomes": {
+            "y_u": _array_identity(labels.y_u),
+            "y_test": _array_identity(labels.y_test),
+        },
+    }
+    return _canonical_payload_digest(payload)
+
+
 @dataclass(frozen=True)
 class FitResult:
     assay_id: str
@@ -1110,6 +1129,56 @@ def _validate_evaluation_provenance(
         raise ValueError("EvaluationLabels cardinalities do not match fit result")
 
 
+def _validate_protocol_trust_root(
+    fit: FitResult,
+    labels: EvaluationLabels,
+    protocol: Protocol,
+) -> None:
+    """Match all task claims to the independently supplied locked protocol."""
+    if not isinstance(protocol, Protocol):
+        raise ValueError("protocol must be Protocol")
+    expected_protocol_digest = canonical_protocol_digest(protocol)
+    if fit.protocol_digest != expected_protocol_digest:
+        raise ValueError("fit protocol_digest does not match the supplied protocol")
+    expected_source_digest = canonical_source_digest(protocol)
+    if fit.source_digest != expected_source_digest:
+        raise ValueError("fit source_digest does not match the supplied protocol")
+    if labels.source_digest != expected_source_digest:
+        raise ValueError(
+            "EvaluationLabels source_digest does not match the supplied protocol"
+        )
+    cardinalities = (
+        ("n_labeled", fit.x_l.shape[0], protocol.n_labeled),
+        ("n_unlabeled", fit.x_u.shape[0], protocol.n_unlabeled),
+        ("n_test", fit.x_test.shape[0], protocol.n_test),
+        ("EvaluationLabels n_unlabeled", labels.y_u.size, protocol.n_unlabeled),
+        ("EvaluationLabels n_test", labels.y_test.size, protocol.n_test),
+    )
+    for name, actual, expected in cardinalities:
+        if actual != expected:
+            raise ValueError(f"fit {name} does not match the supplied protocol")
+    locked_values = (
+        ("q", fit.q, protocol.q),
+        ("pseudo_weight", fit.pseudo_weight, protocol.pseudo_weight),
+        ("ridge_lambda", fit.ridge_lambda, protocol.ridge_lambda),
+        ("damping", fit.damping, protocol.damping),
+        (
+            "random_diagnostic_replicates",
+            fit.random_diagnostic_replicates,
+            protocol.random_diagnostic_replicates,
+        ),
+    )
+    for name, card_actual, card_expected in locked_values:
+        if card_actual != card_expected:
+            raise ValueError(f"fit {name} does not match the supplied protocol")
+    if fit.seed not in protocol.seeds:
+        raise ValueError("fit seed is not a member of the supplied protocol seeds")
+    if labels.seed not in protocol.seeds:
+        raise ValueError(
+            "EvaluationLabels seed is not a member of the supplied protocol seeds"
+        )
+
+
 def _validate_fit_integrity(fit: FitResult) -> None:
     """Fail closed when a frozen fit artifact no longer matches its own card."""
     _identity(fit.assay_id, fit.seed, fit.source_digest)
@@ -1410,7 +1479,9 @@ def evaluate_task(
     fit: FitResult,
     labels: EvaluationLabels,
     *,
+    protocol: Protocol,
     expected_fit_digest: str,
+    expected_evaluation_digest: str,
 ) -> EvaluationResult:
     """Evaluate a frozen fit using hidden labels without refitting or mutation."""
     if not isinstance(fit, FitResult):
@@ -1423,6 +1494,17 @@ def evaluate_task(
         raise ValueError("expected_fit_digest must be a lowercase SHA-256 digest")
     if _canonical_fit_digest_unchecked(fit) != expected_fit_digest:
         raise ValueError("current fit digest does not match expected_fit_digest")
+    if not isinstance(expected_evaluation_digest, str) or not _SHA256_PATTERN.fullmatch(
+        expected_evaluation_digest
+    ):
+        raise ValueError(
+            "expected_evaluation_digest must be a lowercase SHA-256 digest"
+        )
+    if canonical_evaluation_digest(labels) != expected_evaluation_digest:
+        raise ValueError(
+            "current evaluation digest does not match expected_evaluation_digest"
+        )
+    _validate_protocol_trust_root(fit, labels, protocol)
     _validate_fit_integrity(fit)
     _validate_evaluation_provenance(fit, labels)
     y_u = fit.label_transform.transform(labels.y_u)

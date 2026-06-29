@@ -263,6 +263,8 @@ def test_task_plan_requires_external_fit_digest_and_names_oracle_precisely() -> 
         "docs/superpowers/plans/2026-06-29-proteingym-v0-implementation.md"
     ).read_text(encoding="utf-8")
     assert "expected_fit_digest" in plan
+    assert "expected_evaluation_digest" in plan
+    assert "verified hash join" in plan
     assert "test-risk oracle influence" in plan
     assert "frozen teacher pseudo-gradient" in plan
 

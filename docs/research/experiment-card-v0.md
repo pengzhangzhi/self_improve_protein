@@ -16,7 +16,7 @@
 
 **Data / split:** ProteinGym v1.3 substitutions from Zenodo record `15293562`, literal teacher column `ESM1v_ensemble`, first eight lexicographically sorted assays with at least 6,000 usable variants and length at most 512. Per seed: 96 labeled, 2,000 unlabeled, 1,000 test from a fixed hash-sorted 6,000-row working set. The ninth eligible assay is development-only.
 
-**Leakage check:** Selector and fit functions cannot accept hidden unlabeled/test labels. Freeze data checksums, assay IDs, working-set hashes, and split hashes before model evaluation; verify selection invariance after permuting hidden labels.
+**Leakage check:** Selector and fit functions cannot accept hidden unlabeled/test labels. Freeze data checksums, assay IDs, working-set hashes, split hashes, and the canonical fit digest before unblinding. After a verified hash join aligns hidden outcomes to the ordered split hashes, freeze a separate evaluation-label digest before metric computation. Evaluation requires both frozen digests plus the locked protocol trust root; verify selection invariance after permuting hidden labels.
 
 **Seeds:** `[0, 1, 2, 3, 4]`, fixed. Aggregate within assay before confirmatory inference.
 

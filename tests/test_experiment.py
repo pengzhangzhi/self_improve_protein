@@ -15,6 +15,7 @@ from self_improve_protein.experiment import (
     FitResult,
     MethodArtifact,
     _cosine_diagnostic,
+    canonical_evaluation_digest,
     canonical_fit_digest,
     canonical_protocol_digest,
     canonical_source_digest,
@@ -90,11 +91,20 @@ def _methods(fit: FitResult) -> dict[str, MethodArtifact]:
     return {method.name: method for method in fit.methods}
 
 
-def _evaluate_valid(fit: FitResult, labels: EvaluationLabels) -> EvaluationResult:
+def _evaluate_frozen(
+    fit: FitResult,
+    labels: EvaluationLabels,
+    protocol: Protocol,
+    *,
+    expected_fit_digest: str,
+    expected_evaluation_digest: str,
+) -> EvaluationResult:
     return evaluate_task(
         fit,
         labels,
-        expected_fit_digest=canonical_fit_digest(fit),
+        protocol=protocol,
+        expected_fit_digest=expected_fit_digest,
+        expected_evaluation_digest=expected_evaluation_digest,
     )
 
 
@@ -123,6 +133,20 @@ def test_protocol_and_source_digests_are_canonical_and_purpose_scoped() -> None:
     assert canonical_source_digest(protocol) != canonical_source_digest(changed_source)
     assert len(canonical_protocol_digest(protocol)) == 64
     assert len(canonical_source_digest(protocol)) == 64
+
+
+def test_evaluation_digest_binds_identity_hash_order_and_hidden_label_bytes() -> None:
+    _, _, labels = _case()
+    original = canonical_evaluation_digest(labels)
+
+    assert original == canonical_evaluation_digest(labels)
+    assert original != canonical_evaluation_digest(
+        dataclasses.replace(labels, y_u=labels.y_u[::-1])
+    )
+    reversed_hashes = tuple(reversed(labels.test_hashes))
+    assert original != canonical_evaluation_digest(
+        dataclasses.replace(labels, test_hashes=reversed_hashes)
+    )
 
 
 def test_fit_anchors_protocol_and_rejects_mismatched_source_identity() -> None:
@@ -226,6 +250,8 @@ def test_pseudo_methods_satisfy_exact_weighted_normal_equations() -> None:
 def test_hidden_label_permutation_cannot_change_canonical_fit_digest() -> None:
     protocol, inputs, labels = _case()
     fit = fit_task(inputs, protocol)
+    expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
     permuted = dataclasses.replace(
         labels,
         y_u=labels.y_u[::-1],
@@ -234,8 +260,21 @@ def test_hidden_label_permutation_cannot_change_canonical_fit_digest() -> None:
 
     assert canonical_fit_digest(fit) == canonical_fit_digest(fit_task(inputs, protocol))
     assert canonical_fit_digest(fit) == canonical_fit_digest(fit)
-    _evaluate_valid(fit, labels)
-    _evaluate_valid(fit, permuted)
+    _evaluate_frozen(
+        fit,
+        labels,
+        protocol,
+        expected_fit_digest=expected_fit_digest,
+        expected_evaluation_digest=expected_evaluation_digest,
+    )
+    with pytest.raises(ValueError, match="evaluation digest"):
+        _evaluate_frozen(
+            fit,
+            permuted,
+            protocol,
+            expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
+        )
     assert canonical_fit_digest(fit) == canonical_fit_digest(fit)
     assert not np.array_equal(labels.y_u, permuted.y_u)
     assert not np.array_equal(labels.y_test, permuted.y_test)
@@ -317,8 +356,15 @@ def test_evaluate_task_hidden_diagnostics_do_not_mutate_fit() -> None:
     protocol, inputs, labels = _case(random_replicates=9)
     fit = fit_task(inputs, protocol)
     before = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
 
-    evaluation = _evaluate_valid(fit, labels)
+    evaluation = _evaluate_frozen(
+        fit,
+        labels,
+        protocol,
+        expected_fit_digest=before,
+        expected_evaluation_digest=expected_evaluation_digest,
+    )
 
     assert canonical_fit_digest(fit) == before
     assert tuple(metric.name for metric in evaluation.methods) == tuple(
@@ -346,7 +392,15 @@ def test_constant_teacher_test_prediction_is_explicitly_undefined() -> None:
     protocol, inputs, labels = _case()
     inputs = dataclasses.replace(inputs, z_test=np.ones(protocol.n_test))
     fit = fit_task(inputs, protocol)
-    evaluation = _evaluate_valid(fit, labels)
+    expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
+    evaluation = _evaluate_frozen(
+        fit,
+        labels,
+        protocol,
+        expected_fit_digest=expected_fit_digest,
+        expected_evaluation_digest=expected_evaluation_digest,
+    )
 
     assert not evaluation.teacher_test_spearman.defined
     assert evaluation.teacher_test_spearman.value is None
@@ -356,17 +410,54 @@ def test_constant_teacher_test_prediction_is_explicitly_undefined() -> None:
 def test_expected_fit_digest_is_strict_and_required_before_unblinding() -> None:
     protocol, inputs, labels = _case()
     fit = fit_task(inputs, protocol)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
 
     with pytest.raises(ValueError, match="expected_fit_digest"):
-        evaluate_task(fit, labels, expected_fit_digest="not-a-digest")
+        evaluate_task(
+            fit,
+            labels,
+            protocol=protocol,
+            expected_fit_digest="not-a-digest",
+            expected_evaluation_digest=expected_evaluation_digest,
+        )
     with pytest.raises(ValueError, match="fit digest"):
-        evaluate_task(fit, labels, expected_fit_digest="f" * 64)
+        evaluate_task(
+            fit,
+            labels,
+            protocol=protocol,
+            expected_fit_digest="f" * 64,
+            expected_evaluation_digest=expected_evaluation_digest,
+        )
+
+
+def test_expected_evaluation_digest_is_strict_and_required_before_metrics() -> None:
+    protocol, inputs, labels = _case()
+    fit = fit_task(inputs, protocol)
+    expected_fit_digest = canonical_fit_digest(fit)
+
+    with pytest.raises(ValueError, match="expected_evaluation_digest"):
+        evaluate_task(
+            fit,
+            labels,
+            protocol=protocol,
+            expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest="not-a-digest",
+        )
+    with pytest.raises(ValueError, match="evaluation digest"):
+        evaluate_task(
+            fit,
+            labels,
+            protocol=protocol,
+            expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest="f" * 64,
+        )
 
 
 def test_external_digest_rejects_reordered_test_state_and_predictions() -> None:
     protocol, inputs, labels = _case()
     fit = fit_task(inputs, protocol)
     expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
     reversed_methods = tuple(
         dataclasses.replace(
             method,
@@ -386,7 +477,9 @@ def test_external_digest_rejects_reordered_test_state_and_predictions() -> None:
         evaluate_task(
             changed,
             labels,
+            protocol=protocol,
             expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
         )
 
 
@@ -394,6 +487,7 @@ def test_external_digest_rejects_global_card_and_joint_source_rewrites() -> None
     protocol, inputs, labels = _case()
     fit = fit_task(inputs, protocol)
     expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
     changed_weight = fit.pseudo_weight + 0.05
     changed_methods = tuple(
         dataclasses.replace(
@@ -418,18 +512,89 @@ def test_external_digest_rejects_global_card_and_joint_source_rewrites() -> None
         labels,
         source_digest=rewritten_source,
     )
+    changed_source_evaluation_digest = canonical_evaluation_digest(
+        changed_source_labels
+    )
 
     with pytest.raises(ValueError, match="fit digest"):
         evaluate_task(
             changed_card,
             labels,
+            protocol=protocol,
             expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
         )
     with pytest.raises(ValueError, match="fit digest"):
         evaluate_task(
             changed_source_fit,
             changed_source_labels,
+            protocol=protocol,
             expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=changed_source_evaluation_digest,
+        )
+
+
+def test_protocol_root_rejects_fake_protocol_digest_with_fresh_fit_digest() -> None:
+    protocol, inputs, labels = _case()
+    fit = fit_task(inputs, protocol)
+    fake_protocol_digest = "f" * 64
+    assert fake_protocol_digest != canonical_protocol_digest(protocol)
+    changed_fit = dataclasses.replace(
+        fit,
+        protocol_digest=fake_protocol_digest,
+    )
+    changed_fit_digest = canonical_fit_digest(changed_fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
+
+    with pytest.raises(ValueError, match="protocol_digest"):
+        evaluate_task(
+            changed_fit,
+            labels,
+            protocol=protocol,
+            expected_fit_digest=changed_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
+        )
+
+
+def test_protocol_root_rejects_joint_source_rewrite_with_fresh_digests() -> None:
+    protocol, inputs, labels = _case()
+    fit = fit_task(inputs, protocol)
+    rewritten_source = "b" * 64
+    changed_fit = dataclasses.replace(fit, source_digest=rewritten_source)
+    changed_labels = dataclasses.replace(labels, source_digest=rewritten_source)
+    changed_fit_digest = canonical_fit_digest(changed_fit)
+    changed_evaluation_digest = canonical_evaluation_digest(changed_labels)
+
+    with pytest.raises(ValueError, match="source_digest"):
+        evaluate_task(
+            changed_fit,
+            changed_labels,
+            protocol=protocol,
+            expected_fit_digest=changed_fit_digest,
+            expected_evaluation_digest=changed_evaluation_digest,
+        )
+
+
+def test_protocol_root_rejects_relabelled_alternate_weight_fit() -> None:
+    protocol, inputs, labels = _case()
+    alternate_data = protocol.model_dump(mode="python")
+    alternate_data["pseudo_weight"] = 0.2
+    alternate_protocol = Protocol.model_validate(alternate_data)
+    alternate_fit = fit_task(inputs, alternate_protocol)
+    relabelled_fit = dataclasses.replace(
+        alternate_fit,
+        protocol_digest=canonical_protocol_digest(protocol),
+    )
+    relabelled_fit_digest = canonical_fit_digest(relabelled_fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
+
+    with pytest.raises(ValueError, match="pseudo_weight"):
+        evaluate_task(
+            relabelled_fit,
+            labels,
+            protocol=protocol,
+            expected_fit_digest=relabelled_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
         )
 
 
@@ -513,12 +678,20 @@ def test_evaluation_provenance_mismatch_fails_closed(field: str) -> None:
         "seed": 4,
         "source_digest": "b" * 64,
     }
+    changed_labels = dataclasses.replace(
+        labels,
+        **{field: replacements[field]},
+    )
+    expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(changed_labels)
 
     with pytest.raises(ValueError, match=field):
         evaluate_task(
             fit,
-            dataclasses.replace(labels, **{field: replacements[field]}),
-            expected_fit_digest=canonical_fit_digest(fit),
+            changed_labels,
+            protocol=protocol,
+            expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
         )
 
 
@@ -531,12 +704,17 @@ def test_evaluation_split_hash_mismatch_fails_closed(hash_field: str) -> None:
     fit = fit_task(inputs, protocol)
     hashes = list(getattr(labels, hash_field))
     hashes[0] = "f" * 64
+    changed_labels = dataclasses.replace(labels, **{hash_field: tuple(hashes)})
+    expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(changed_labels)
 
     with pytest.raises(ValueError, match=hash_field):
         evaluate_task(
             fit,
-            dataclasses.replace(labels, **{hash_field: tuple(hashes)}),
-            expected_fit_digest=canonical_fit_digest(fit),
+            changed_labels,
+            protocol=protocol,
+            expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
         )
 
 
@@ -555,6 +733,7 @@ def test_evaluation_rejects_tampered_method_card_fields(tamper: str) -> None:
     protocol, inputs, labels = _case()
     fit = fit_task(inputs, protocol)
     expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
     methods = list(fit.methods)
     random_method = methods[1]
     if tamper == "selected_count":
@@ -595,7 +774,9 @@ def test_evaluation_rejects_tampered_method_card_fields(tamper: str) -> None:
         evaluate_task(
             dataclasses.replace(fit, methods=tuple(methods)),
             labels,
+            protocol=protocol,
             expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
         )
 
 
@@ -603,6 +784,7 @@ def test_evaluation_rejects_tampered_teacher_calibration() -> None:
     protocol, inputs, labels = _case()
     fit = fit_task(inputs, protocol)
     expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
     changed_calibration = dataclasses.replace(
         fit.teacher_calibration,
         slope=fit.teacher_calibration.slope + 0.1,
@@ -617,7 +799,9 @@ def test_evaluation_rejects_tampered_teacher_calibration() -> None:
         evaluate_task(
             dataclasses.replace(fit, teacher_calibration=changed_calibration),
             labels,
+            protocol=protocol,
             expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
         )
 
 
@@ -625,6 +809,7 @@ def test_evaluation_rejects_missing_random_diagnostic_replicate() -> None:
     protocol, inputs, labels = _case(random_replicates=5)
     fit = fit_task(inputs, protocol)
     expected_fit_digest = canonical_fit_digest(fit)
+    expected_evaluation_digest = canonical_evaluation_digest(labels)
     changed = dataclasses.replace(
         fit,
         random_diagnostic_indices=fit.random_diagnostic_indices[:-1],
@@ -634,7 +819,9 @@ def test_evaluation_rejects_missing_random_diagnostic_replicate() -> None:
         evaluate_task(
             changed,
             labels,
+            protocol=protocol,
             expected_fit_digest=expected_fit_digest,
+            expected_evaluation_digest=expected_evaluation_digest,
         )
 
 
