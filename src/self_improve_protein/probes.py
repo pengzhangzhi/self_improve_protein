@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import TypeAlias, cast
 
@@ -15,6 +18,7 @@ from numpy.typing import NDArray
 from self_improve_protein.provenance import (
     atomic_write_json,
     sha256_bytes,
+    sha256_file,
 )
 from self_improve_protein.ridge import (
     fit_weighted_ridge,
@@ -46,6 +50,26 @@ _CAUSAL_SAMPLE_COUNT = 80
 _CAUSAL_FEATURE_COUNT = 5
 _CAUSAL_RIDGE_LAMBDA = 0.4
 _SELECTION_COUNT = 3
+_VERIFICATION_RUNG_DIRECTORIES = ("r1", "r2", "r3")
+_VERIFICATION_RELATIVE_FILES = (
+    "r1/report.json",
+    "r1/fresh-environment-resolution.json",
+    "r2/pytest.txt",
+    "r2/algebra_probe.json",
+    "r3/synthetic_probe.json",
+)
+_VERIFICATION_REPORT_OUTPUT_FILES = _VERIFICATION_RELATIVE_FILES[1:]
+_TRUST_ROOT_HASH_FIELDS = (
+    "pyproject_sha256",
+    "uv_lock_sha256",
+    "config_sha256",
+    "verification_script_sha256",
+    "python_executable_sha256",
+    "uv_executable_sha256",
+    "pytest_executable_sha256",
+    "ruff_executable_sha256",
+    "mypy_executable_sha256",
+)
 
 
 def _canonical_digest(payload: object) -> str:
@@ -83,16 +107,11 @@ def _learnability_probe(seed: int) -> dict[str, object]:
     x = generator.normal(
         size=(_LEARNABILITY_SAMPLE_COUNT, _LEARNABILITY_FEATURE_COUNT)
     ).astype(np.float64)
-    theta_true = generator.normal(size=_LEARNABILITY_FEATURE_COUNT).astype(
-        np.float64
-    )
+    theta_true = generator.normal(size=_LEARNABILITY_FEATURE_COUNT).astype(np.float64)
     y = np.asarray(x @ theta_true, dtype=np.float64)
     theta = fit_weighted_ridge(x, y, LEARNABILITY_RIDGE_LAMBDA)
     residual = np.asarray(x @ theta - y, dtype=np.float64)
-    normal_residual = (
-        x.T @ residual
-        + x.shape[0] * LEARNABILITY_RIDGE_LAMBDA * theta
-    )
+    normal_residual = x.T @ residual + x.shape[0] * LEARNABILITY_RIDGE_LAMBDA * theta
 
     return {
         "seed": seed,
@@ -110,9 +129,7 @@ def _learnability_probe(seed: int) -> dict[str, object]:
         "tolerances": {
             "train_mse": LEARNABILITY_TRAIN_MSE_TOLERANCE,
             "parameter_error_norm": LEARNABILITY_PARAMETER_ERROR_TOLERANCE,
-            "normal_equation_residual_norm": (
-                LEARNABILITY_NORMAL_EQUATION_TOLERANCE
-            ),
+            "normal_equation_residual_norm": (LEARNABILITY_NORMAL_EQUATION_TOLERANCE),
         },
     }
 
@@ -134,9 +151,7 @@ def _exact_perturbed_fit(
     epsilon: float,
 ) -> tuple[FloatArray, float]:
     x_augmented = np.vstack((x_l, x_candidate[None, :])).astype(np.float64)
-    y_augmented = np.concatenate(
-        (y_l, np.asarray([yhat_candidate], dtype=np.float64))
-    )
+    y_augmented = np.concatenate((y_l, np.asarray([yhat_candidate], dtype=np.float64)))
     weights = np.concatenate(
         (
             np.full(
@@ -155,17 +170,16 @@ def _exact_perturbed_fit(
     )
     weighted_residual = x_augmented @ theta - y_augmented
     normal_residual = (
-        x_augmented.T @ (weights * weighted_residual)
-        + ridge_lambda * theta
+        x_augmented.T @ (weights * weighted_residual) + ridge_lambda * theta
     )
     return theta, float(np.linalg.norm(normal_residual))
 
 
 def _causal_score_probe(seed: int, epsilon: float) -> dict[str, object]:
     generator = np.random.Generator(np.random.PCG64(seed))
-    x_l = generator.normal(
-        size=(_CAUSAL_SAMPLE_COUNT, _CAUSAL_FEATURE_COUNT)
-    ).astype(np.float64)
+    x_l = generator.normal(size=(_CAUSAL_SAMPLE_COUNT, _CAUSAL_FEATURE_COUNT)).astype(
+        np.float64
+    )
     theta_truth = generator.normal(size=_CAUSAL_FEATURE_COUNT).astype(np.float64)
     noise = 0.2 * generator.normal(size=_CAUSAL_SAMPLE_COUNT)
     y_l = np.asarray(x_l @ theta_truth + noise, dtype=np.float64)
@@ -220,9 +234,7 @@ def _causal_score_probe(seed: int, epsilon: float) -> dict[str, object]:
             ridge_lambda=_CAUSAL_RIDGE_LAMBDA,
             epsilon=epsilon,
         )
-        realized_changes.append(
-            squared_loss(x_l, y_l, perturbed_theta) - baseline_loss
-        )
+        realized_changes.append(squared_loss(x_l, y_l, perturbed_theta) - baseline_loss)
         perturbed_normal_residuals.append(normal_residual)
 
     realized = np.asarray(realized_changes, dtype=np.float64)
@@ -233,9 +245,7 @@ def _causal_score_probe(seed: int, epsilon: float) -> dict[str, object]:
     realized_order = np.argsort(realized, kind="stable")
 
     self_yhat = np.asarray(x_u @ theta, dtype=np.float64)
-    self_pseudo_gradients = (
-        (x_u @ theta - self_yhat)[:, None] * x_u
-    )
+    self_pseudo_gradients = (x_u @ theta - self_yhat)[:, None] * x_u
     self_scores = influence_scores(
         x_l,
         y_l,
@@ -293,14 +303,10 @@ def _causal_score_probe(seed: int, epsilon: float) -> dict[str, object]:
         "full_h_score_statistics": _score_statistics(scores),
         "no_h_scores": _float_list(no_h_scores),
         "no_h_score_statistics": _score_statistics(no_h_scores),
-        "no_h_formula_max_abs_error": float(
-            np.max(np.abs(no_h_scores - manual_no_h))
-        ),
+        "no_h_formula_max_abs_error": float(np.max(np.abs(no_h_scores - manual_no_h))),
         "predicted_loss_changes": _float_list(predicted),
         "realized_loss_changes": _float_list(realized),
-        "finite_difference_derivatives": _float_list(
-            finite_difference_derivatives
-        ),
+        "finite_difference_derivatives": _float_list(finite_difference_derivatives),
         "derivative_errors": _float_list(derivative_errors),
         "derivative_max_abs_error": float(np.max(np.abs(derivative_errors))),
         "first_order_signs_match": bool(
@@ -515,13 +521,9 @@ def validate_synthetic_probe(
         for field in ("x_dtype", "y_dtype", "theta_dtype")
     ):
         raise ValueError("learnability dtypes must be float64")
-    if _finite_number(learnability, "ridge_lambda") != (
-        LEARNABILITY_RIDGE_LAMBDA
-    ):
+    if _finite_number(learnability, "ridge_lambda") != (LEARNABILITY_RIDGE_LAMBDA):
         raise ValueError("learnability ridge lambda is not locked")
-    if _finite_number(learnability, "train_mse") >= (
-        LEARNABILITY_TRAIN_MSE_TOLERANCE
-    ):
+    if _finite_number(learnability, "train_mse") >= (LEARNABILITY_TRAIN_MSE_TOLERANCE):
         raise ValueError("learnability train MSE exceeds tolerance")
     if _finite_number(learnability, "parameter_error_norm") >= (
         LEARNABILITY_PARAMETER_ERROR_TOLERANCE
@@ -608,9 +610,7 @@ def validate_synthetic_probe(
     if not min(scores) < 0.0 < max(scores):
         raise ValueError("causal full-H scores must contain both signs")
     expected_predicted = [-CAUSAL_EPSILON * score for score in scores]
-    expected_finite_difference = [
-        change / CAUSAL_EPSILON for change in realized
-    ]
+    expected_finite_difference = [change / CAUSAL_EPSILON for change in realized]
     expected_errors = [
         derivative + score
         for derivative, score in zip(
@@ -730,9 +730,7 @@ def validate_synthetic_probe(
             no_h_scores,
         ),
     )
-    for indices_field, hashes_field, digest_field, method_scores in (
-        selection_contracts
-    ):
+    for indices_field, hashes_field, digest_field, method_scores in selection_contracts:
         indices = selection.get(indices_field)
         selected_hashes = selection.get(hashes_field)
         digest = selection.get(digest_field)
@@ -807,6 +805,394 @@ def write_synthetic_probe(
     if algebra_output is not None:
         atomic_write_json(algebra_output, payload["algebra"])
     return payload
+
+
+def require_clean_verification_git_state(
+    repository: Path | str,
+    *,
+    expected_head: str | None = None,
+) -> str:
+    """Return HEAD only when all tracked/untracked files are clean and stable."""
+    root = Path(repository).resolve()
+    if expected_head is not None and (
+        not isinstance(expected_head, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", expected_head)
+    ):
+        raise ValueError("expected_head must be a lowercase 40-character git hash")
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("repository must be an accessible git worktree") from error
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise ValueError("git HEAD must be a lowercase 40-character hash")
+    if status:
+        raise ValueError("verification requires a clean git worktree")
+    if expected_head is not None and head != expected_head:
+        raise ValueError(f"verification HEAD changed from {expected_head} to {head}")
+    return head
+
+
+def _json_mapping_file(path: Path, *, name: str) -> dict[str, object]:
+    try:
+        payload: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"{name} must be readable JSON") from error
+    return _mapping(payload, name=name)
+
+
+def _verification_files(root: Path) -> set[str]:
+    files: set[str] = set()
+    for directory_name in _VERIFICATION_RUNG_DIRECTORIES:
+        directory = root / directory_name
+        if not directory.is_dir() or directory.is_symlink():
+            raise ValueError(f"verification {directory_name} must be a directory")
+        for path in directory.rglob("*"):
+            if path.is_symlink():
+                raise ValueError("verification artifacts must not contain symlinks")
+            if path.is_file():
+                files.add(path.relative_to(root).as_posix())
+    return files
+
+
+def _validated_trust_root(
+    payload: object,
+    *,
+    git_head: str,
+) -> dict[str, object]:
+    trust_root = _mapping(payload, name="verification trust root")
+    if set(trust_root) != {"git_head", *_TRUST_ROOT_HASH_FIELDS}:
+        raise ValueError("verification trust root fields are incomplete")
+    if trust_root.get("git_head") != git_head:
+        raise ValueError("verification trust root git HEAD is inconsistent")
+    for field in _TRUST_ROOT_HASH_FIELDS:
+        value = trust_root.get(field)
+        if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError(f"verification trust root {field} is invalid")
+    return trust_root
+
+
+def _validate_fresh_environment_resolution(payload: object) -> None:
+    resolution = _mapping(payload, name="fresh environment resolution")
+    sync = _mapping(resolution.get("sync"), name="fresh environment sync")
+    if sync.get("action") != "create":
+        raise ValueError("fresh environment resolution must create a new environment")
+    environment = _mapping(
+        sync.get("environment"),
+        name="fresh environment target",
+    )
+    environment_path = environment.get("path")
+    if not isinstance(environment_path, str) or not environment_path.strip():
+        raise ValueError("fresh environment target path is invalid")
+    if Path(environment_path).name == ".venv":
+        raise ValueError("fresh environment proof must not target ambient .venv")
+    changes = sync.get("changes")
+    if not isinstance(changes, list):
+        raise ValueError("fresh environment changes must be a list")
+    versions: dict[str, str] = {}
+    for raw_change in changes:
+        change = _mapping(raw_change, name="fresh environment change")
+        name = change.get("name")
+        version = change.get("version")
+        action = change.get("action")
+        if isinstance(name, str) and isinstance(version, str) and action == "installed":
+            versions[name] = version
+    expected = {"torch": "2.10.0", "transformers": "4.57.6"}
+    if any(versions.get(name) != version for name, version in expected.items()):
+        raise ValueError("fresh environment resolution omits pinned embed dependencies")
+
+
+def _expected_artifact_paths(artifact_root: Path) -> dict[str, str]:
+    return {
+        "r1_report": str(artifact_root / "r1" / "report.json"),
+        "fresh_environment_resolution": str(
+            artifact_root / "r1" / "fresh-environment-resolution.json"
+        ),
+        "r2_pytest": str(artifact_root / "r2" / "pytest.txt"),
+        "r2_algebra": str(artifact_root / "r2" / "algebra_probe.json"),
+        "r3_probe": str(artifact_root / "r3" / "synthetic_probe.json"),
+        "completion": str(artifact_root / "completion.json"),
+    }
+
+
+def _validate_verification_content(
+    content_root: Path,
+    *,
+    artifact_root: Path,
+    completion: dict[str, object],
+    expected_git_head: str | None,
+) -> None:
+    if _verification_files(content_root) != set(_VERIFICATION_RELATIVE_FILES):
+        raise ValueError("verification bundle has missing or stale artifact files")
+    if completion.get("schema_version") != 1 or completion.get("status") != "passed":
+        raise ValueError("verification completion schema or status is invalid")
+    git_head = completion.get("git_head")
+    if not isinstance(git_head, str) or not re.fullmatch(r"[0-9a-f]{40}", git_head):
+        raise ValueError("verification completion git HEAD is invalid")
+    if expected_git_head is not None and git_head != expected_git_head:
+        raise ValueError(
+            "verification completion git HEAD does not match expected HEAD"
+        )
+    published_at = completion.get("published_at")
+    if not isinstance(published_at, str) or not published_at.strip():
+        raise ValueError("verification completion timestamp is invalid")
+    if completion.get("artifact_root") != str(artifact_root):
+        raise ValueError("verification completion artifact root is inconsistent")
+    expected_paths = {
+        relative_path: str(artifact_root / relative_path)
+        for relative_path in _VERIFICATION_RELATIVE_FILES
+    }
+    if completion.get("artifact_paths") != expected_paths:
+        raise ValueError("verification completion artifact paths are inconsistent")
+    trust_root = _validated_trust_root(completion.get("trust_root"), git_head=git_head)
+
+    output_hashes = _mapping(
+        completion.get("output_sha256"),
+        name="verification output hashes",
+    )
+    if set(output_hashes) != set(_VERIFICATION_RELATIVE_FILES):
+        raise ValueError("verification completion output hashes are incomplete")
+    for relative_path in _VERIFICATION_RELATIVE_FILES:
+        digest = output_hashes.get(relative_path)
+        if not isinstance(digest, str) or not _SHA256_PATTERN.fullmatch(digest):
+            raise ValueError(f"verification SHA-256 for {relative_path} is invalid")
+        if sha256_file(content_root / relative_path) != digest:
+            raise ValueError(f"verification SHA-256 mismatch for {relative_path}")
+
+    report = _json_mapping_file(
+        content_root / "r1" / "report.json",
+        name="R1 report",
+    )
+    if (
+        report.get("schema_version") != 2
+        or report.get("rung") != "R1"
+        or report.get("status") != "passed"
+        or report.get("git_head") != git_head
+    ):
+        raise ValueError("R1 report schema, status, or git HEAD is invalid")
+    if report.get("artifacts") != _expected_artifact_paths(artifact_root):
+        raise ValueError("R1 report does not honor the configured artifact root")
+    if report.get("trust_root") != trust_root:
+        raise ValueError("R1 report trust root differs from completion")
+    repository_state = _mapping(
+        report.get("repository_state"),
+        name="R1 repository state",
+    )
+    if repository_state != {
+        "start_head": git_head,
+        "end_head": git_head,
+        "start_clean": True,
+        "end_clean": True,
+    }:
+        raise ValueError("R1 report is not bound to one clean stable git HEAD")
+    expected_command_names = {
+        "r1_fresh_environment_resolution",
+        "r1_package_import",
+        "r1_locked_config",
+        "r1_cli_help",
+        "r1_ruff",
+        "r1_mypy",
+        "r2_targeted_pytest",
+        "r2_full_pytest",
+        "r3_synthetic_probe",
+    }
+    commands = report.get("commands")
+    if not isinstance(commands, list):
+        raise ValueError("R1 commands must be a list")
+    command_mappings = [_mapping(command, name="R1 command") for command in commands]
+    if (
+        len(command_mappings) != len(expected_command_names)
+        or {command.get("name") for command in command_mappings}
+        != expected_command_names
+        or any(command.get("exit_code") != 0 for command in command_mappings)
+    ):
+        raise ValueError("R1 commands are missing, duplicated, or failed")
+    config = _mapping(report.get("config"), name="R1 config")
+    if config.get("sha256") != trust_root.get("config_sha256"):
+        raise ValueError("R1 config hash differs from trust root")
+    toolchain = _mapping(report.get("toolchain"), name="R1 toolchain")
+    for name in ("python", "uv", "pytest", "ruff", "mypy"):
+        tool = _mapping(toolchain.get(name), name=f"R1 {name} toolchain")
+        if tool.get("sha256") != trust_root.get(f"{name}_executable_sha256"):
+            raise ValueError(f"R1 {name} hash differs from trust root")
+    report_hashes = _mapping(
+        report.get("output_sha256"),
+        name="R1 output hashes",
+    )
+    if set(report_hashes) != set(_VERIFICATION_REPORT_OUTPUT_FILES):
+        raise ValueError("R1 report output hashes are incomplete")
+    for relative_path in _VERIFICATION_REPORT_OUTPUT_FILES:
+        if report_hashes.get(relative_path) != output_hashes.get(relative_path):
+            raise ValueError(f"R1 output SHA-256 for {relative_path} is inconsistent")
+    report_content_digest = report.get("report_content_sha256")
+    if not isinstance(report_content_digest, str) or not _SHA256_PATTERN.fullmatch(
+        report_content_digest
+    ):
+        raise ValueError("R1 report content digest is invalid")
+    unsigned_report = dict(report)
+    del unsigned_report["report_content_sha256"]
+    if _canonical_digest(unsigned_report) != report_content_digest:
+        raise ValueError("R1 report content digest does not match report")
+    package_versions = _mapping(
+        report.get("package_versions"),
+        name="R1 package versions",
+    )
+    if package_versions.get("torch") != "2.10.0":
+        raise ValueError("R1 report must record torch 2.10.0")
+    if package_versions.get("transformers") != "4.57.6":
+        raise ValueError("R1 report must record transformers 4.57.6")
+
+    resolution = _json_mapping_file(
+        content_root / "r1" / "fresh-environment-resolution.json",
+        name="fresh environment resolution",
+    )
+    _validate_fresh_environment_resolution(resolution)
+    probe = _json_mapping_file(
+        content_root / "r3" / "synthetic_probe.json",
+        name="R3 synthetic probe",
+    )
+    validate_synthetic_probe(probe)
+    algebra = _json_mapping_file(
+        content_root / "r2" / "algebra_probe.json",
+        name="R2 algebra probe",
+    )
+    if algebra != probe.get("algebra"):
+        raise ValueError("R2 algebra probe differs from R3 algebra payload")
+    try:
+        pytest_output = (content_root / "r2" / "pytest.txt").read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError("R2 pytest output must be readable") from error
+    if pytest_output.count("exit_code=0") != 2:
+        raise ValueError("R2 pytest output must record two passing commands")
+
+
+def build_verification_completion(
+    staging_root: Path | str,
+    *,
+    artifact_root: Path | str,
+    git_head: str,
+    trust_root: dict[str, object],
+    published_at: str,
+) -> dict[str, object]:
+    """Build and validate the completion marker for one staged R1-R3 bundle."""
+    staging = Path(staging_root).resolve()
+    destination = Path(artifact_root).resolve()
+    if not re.fullmatch(r"[0-9a-f]{40}", git_head):
+        raise ValueError("git_head must be a lowercase 40-character hash")
+    if not isinstance(published_at, str) or not published_at.strip():
+        raise ValueError("published_at must be a non-empty timestamp")
+    validated_trust_root = _validated_trust_root(trust_root, git_head=git_head)
+    if _verification_files(staging) != set(_VERIFICATION_RELATIVE_FILES):
+        raise ValueError("staged verification bundle has missing or stale files")
+    output_hashes = {
+        relative_path: sha256_file(staging / relative_path)
+        for relative_path in _VERIFICATION_RELATIVE_FILES
+    }
+    completion: dict[str, object] = {
+        "schema_version": 1,
+        "status": "passed",
+        "git_head": git_head,
+        "published_at": published_at,
+        "artifact_root": str(destination),
+        "trust_root": validated_trust_root,
+        "artifact_paths": {
+            relative_path: str(destination / relative_path)
+            for relative_path in _VERIFICATION_RELATIVE_FILES
+        },
+        "output_sha256": output_hashes,
+    }
+    _validate_verification_content(
+        staging,
+        artifact_root=destination,
+        completion=completion,
+        expected_git_head=git_head,
+    )
+    return completion
+
+
+def _fsync_directory_path(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_verification_bundle(
+    staging_root: Path | str,
+    artifact_root: Path | str,
+    completion: dict[str, object],
+) -> None:
+    """Publish exact R1-R3 directories, making completion authoritative last."""
+    staging = Path(staging_root).resolve()
+    destination = Path(artifact_root).resolve()
+    if staging.parent != destination.parent:
+        raise ValueError("verification staging directory must be a sibling of output")
+    _validate_verification_content(
+        staging,
+        artifact_root=destination,
+        completion=completion,
+        expected_git_head=cast(str, completion.get("git_head")),
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    completion_path = destination / "completion.json"
+    completion_path.unlink(missing_ok=True)
+    _fsync_directory_path(destination)
+    for directory_name in _VERIFICATION_RUNG_DIRECTORIES:
+        source = staging / directory_name
+        target = destination / directory_name
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+        os.replace(source, target)
+        _fsync_directory_path(destination)
+    atomic_write_json(completion_path, completion)
+    validate_verification_bundle(
+        destination,
+        expected_git_head=cast(str, completion.get("git_head")),
+    )
+
+
+def validate_verification_bundle(
+    artifact_root: Path | str,
+    *,
+    expected_git_head: str | None = None,
+) -> dict[str, object]:
+    """Validate the authoritative completion marker and every published byte."""
+    destination = Path(artifact_root).resolve()
+    completion_path = destination / "completion.json"
+    if not completion_path.is_file() or completion_path.is_symlink():
+        raise ValueError("verification completion marker is missing")
+    completion = _json_mapping_file(
+        completion_path,
+        name="verification completion",
+    )
+    _validate_verification_content(
+        destination,
+        artifact_root=destination,
+        completion=completion,
+        expected_git_head=expected_git_head,
+    )
+    return completion
 
 
 def _parse_arguments() -> argparse.Namespace:

@@ -50,7 +50,7 @@ tested.
 | Full score uses `g_L`, `H`, and `rho=1e-4`; efficient vectorization; descending stable-hash ties | `selection.influence_scores` and `stable_top_k`; protocol-checked task assembly in `experiment` | `test_selection.py`, `test_experiment.py`; R3 exact zero-damping finite difference | R2 score statistics; per-task scores and selection hashes |
 | Select exactly `q=192`; do not filter to positive scores | Strict protocol count and task-artifact verification | `test_config.py`, `test_selection.py`, `test_experiment.py` | Per-method selected count and positive-score fraction |
 | Retrain pseudo methods with `w=0.1` and `D=n+wq`, including `D * lambda` | Weight-normalized solver in `ridge.fit_weighted_ridge`; task validation recomputes normal equations | `test_ridge.py`, `test_experiment.py` | Coefficients, weights, stationarity residuals |
-| Four confirmatory methods differ only in selection; random has an independent stream | `experiment.METHOD_NAMES`, method-specific selection with common transformed inputs and pseudo-labels | `test_experiment.py`, `test_selection.py` | Five method rows per task wave, with no-H separately marked exploratory |
+| Three pseudo-label methods differ only in selection; the supervised-only method uses no pseudo-samples; random has an independent stream | `experiment.METHOD_NAMES`, method-specific selection with common transformed inputs and pseudo-labels | `test_experiment.py`, `test_selection.py` | Five method rows per task wave, with no-H separately marked exploratory |
 | No-Hessian ablation replaces inverse-H geometry by identity only | `selection.no_hessian_scores`; separately carded method in `experiment` | `test_selection.py`, `test_experiment.py`, R3 explicit-formula equality | Full/no-H selection hashes and overlap |
 | Primary metric is assay-macro paired Spearman `ours-random`; MSE/NDCG are secondary | Strict metric implementations in `metrics`; method and contrast constants in `analysis` | `test_metrics.py`, `test_analysis.py` | Task metrics, assay table, aggregate table |
 | NDCG@10% uses true-fitness min-max gains and floor 10% cutoff | `metrics.ndcg_at_10_percent` | `test_metrics.py` including pinned ProteinGym parity | Recomputable predictions and metric table |
@@ -67,22 +67,32 @@ tested.
 ## R1-R3 artifact contract
 
 `scripts/verify_r1_r3.sh` is an offline, CPU-only, fail-fast gate. It discovers
-the repository rather than assuming a checkout path and writes all outputs to a
-temporary directory. It publishes files with `os.replace` only after every
-command and schema validation succeeds.
+the repository rather than assuming a checkout path, refuses to start from a
+dirty worktree, and requires the same clean HEAD again after all commands. It
+stages every output in a temporary sibling of the configured
+`SELF_IMPROVE_VERIFICATION_ROOT`. After schema and hash validation, it replaces
+the exact R1-R3 directories and atomically publishes `completion.json` last.
+Without that final marker, existing files are not a passed verification run.
 
-- `artifacts/verification/r1/report.json` records UTC timestamps, exact command
-  strings and exit codes, bounded output tails and complete output hashes, git
-  HEAD/status, Python and package versions, the validated config dump and
-  digest, and the numerical-runtime fingerprint.
-- `artifacts/verification/r2/pytest.txt` captures both targeted algebra/data/
+- `r1/fresh-environment-resolution.json` records an offline `uv sync --dry-run`
+  against a nonexistent environment with both `dev` and `embed` extras. It
+  proves the lock declares pinned `torch==2.10.0` and
+  `transformers==4.57.6`, independent of packages already in `.venv`.
+- `r1/report.json` records UTC timestamps, exact command strings and exit codes,
+  bounded output tails and complete output hashes, the stable clean git HEAD,
+  exact torch/transformers versions, the validated config dump, numerical
+  fingerprint, and SHA-256 values for `pyproject.toml`, `uv.lock`, config,
+  verification script, Python, uv, pytest, Ruff, and mypy.
+- `r2/pytest.txt` captures both targeted algebra/data/
   leakage/pooling/metrics/task tests and the complete test suite.
-- `artifacts/verification/r2/algebra_probe.json` records dimensions, dtypes,
+- `r2/algebra_probe.json` records dimensions, dtypes,
   finite checks, normal-equation/gradient residuals, and score statistics.
-- `artifacts/verification/r3/synthetic_probe.json` records a seeded noiseless
+- `r3/synthetic_probe.json` records a seeded noiseless
   learnability problem, exact one-candidate perturbation results at
   `epsilon=1e-6`, full-H/no-H scores, the literal self-teacher negative control,
   selected hashes, and two matching deterministic run digests.
+- `completion.json` binds the configured artifact root, git/trust root, and
+  SHA-256 of every R1-R3 file. It is the sole authoritative success marker.
 
 The R3 causal check intentionally uses zero score damping so that the score is
 the exact derivative of the explicitly perturbed objective. Confirmatory v0
@@ -99,6 +109,10 @@ R3 does not claim that a damped score is the exact undamped derivative.
   were implemented, the focused probe suite passed. The final authoritative
   counts, static checks, commands, and hashes are the locally generated R1-R3
   artifacts, not this narrative entry.
+- **Hardening RED/GREEN (2026-06-29):** review tests first failed collection on
+  the missing bundle publication API, then passed after clean-HEAD binding,
+  fresh-environment proof, custom-root paths, exact output hashes, and
+  interruption/stale-artifact fail-closed publication were implemented.
 
 ## Known scientific and numerical caveats
 

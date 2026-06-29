@@ -5,9 +5,21 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR" && git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+START_HEAD="$(git rev-parse HEAD)"
+START_STATUS="$(git status --porcelain=v1 --untracked-files=all)"
+if [[ -n "$START_STATUS" ]]; then
+    printf 'verification requires a clean git worktree before start:\n%s\n' \
+        "$START_STATUS" >&2
+    exit 1
+fi
+
 ARTIFACT_ROOT="${SELF_IMPROVE_VERIFICATION_ROOT:-$REPO_ROOT/artifacts/verification}"
-mkdir -p "$ARTIFACT_ROOT"
-TEMP_ROOT="$(mktemp -d "$ARTIFACT_ROOT/.r1-r3.XXXXXX")"
+ARTIFACT_PARENT="$(dirname -- "$ARTIFACT_ROOT")"
+ARTIFACT_NAME="$(basename -- "$ARTIFACT_ROOT")"
+mkdir -p "$ARTIFACT_PARENT"
+ARTIFACT_PARENT="$(cd "$ARTIFACT_PARENT" && pwd)"
+ARTIFACT_ROOT="$ARTIFACT_PARENT/$ARTIFACT_NAME"
+TEMP_ROOT="$(mktemp -d "$ARTIFACT_PARENT/.${ARTIFACT_NAME}.r1-r3.XXXXXX")"
 STATUS_FILE="$TEMP_ROOT/commands.tsv"
 STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 trap 'rm -rf -- "$TEMP_ROOT"' EXIT
@@ -45,11 +57,17 @@ record_command() {
     fi
 }
 
-UV_BASE=(uv run --frozen --offline --extra dev)
+UV_BASE=(uv run --frozen --offline --extra dev --extra embed)
+
+record_command r1_fresh_environment_resolution \
+    bash -c \
+    'set -euo pipefail; env UV_PROJECT_ENVIRONMENT="$1" uv sync --dry-run --locked --offline --extra dev --extra embed --output-format json > "$2"' \
+    _ "$TEMP_ROOT/fresh-environment" \
+    "$TEMP_ROOT/r1/fresh-environment-resolution.json"
 
 record_command r1_package_import \
     "${UV_BASE[@]}" python -c \
-    'import self_improve_protein; print(self_improve_protein.__version__)'
+    'import self_improve_protein, torch, transformers; print(self_improve_protein.__version__, torch.__version__, transformers.__version__)'
 record_command r1_locked_config \
     "${UV_BASE[@]}" python -c \
     'import json; from self_improve_protein.config import load_protocol; p=load_protocol("configs/v0.yaml"); assert (p.working_size,p.n_labeled,p.n_unlabeled,p.n_test,p.q,p.pseudo_weight,p.ridge_lambda,p.damping)==(6000,96,2000,1000,192,0.1,0.01,0.0001); print(json.dumps(p.model_dump(mode="json"),allow_nan=False,sort_keys=True))'
@@ -86,13 +104,26 @@ record_command r3_synthetic_probe \
     cat "$TEMP_ROOT/command-logs/r2_full_pytest.txt"
 } > "$TEMP_ROOT/r2/pytest.txt"
 
-"${UV_BASE[@]}" python - "$STATUS_FILE" "$TEMP_ROOT" "$STARTED_AT" <<'PY'
+END_HEAD="$(git rev-parse HEAD)"
+END_STATUS="$(git status --porcelain=v1 --untracked-files=all)"
+if [[ "$END_HEAD" != "$START_HEAD" ]]; then
+    printf 'verification HEAD changed from %s to %s\n' "$START_HEAD" "$END_HEAD" >&2
+    exit 1
+fi
+if [[ -n "$END_STATUS" ]]; then
+    printf 'verification worktree became dirty:\n%s\n' "$END_STATUS" >&2
+    exit 1
+fi
+
+"${UV_BASE[@]}" python - \
+    "$STATUS_FILE" "$TEMP_ROOT" "$STARTED_AT" "$START_HEAD" \
+    "$ARTIFACT_ROOT" "$SCRIPT_DIR/verify_r1_r3.sh" <<'PY'
 import csv
 import dataclasses
-import hashlib
 import importlib.metadata
 import json
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -103,11 +134,18 @@ from self_improve_protein.experiment import (
     canonical_protocol_digest,
     current_numerical_runtime_fingerprint,
 )
-from self_improve_protein.provenance import atomic_write_json, sha256_file
+from self_improve_protein.provenance import (
+    atomic_write_json,
+    sha256_bytes,
+    sha256_file,
+)
 
 status_path = Path(sys.argv[1])
 temporary_root = Path(sys.argv[2])
 started_at = sys.argv[3]
+expected_head = sys.argv[4]
+artifact_root = Path(sys.argv[5]).resolve()
+verification_script = Path(sys.argv[6]).resolve()
 commands = []
 with status_path.open(encoding="utf-8", newline="") as handle:
     for row in csv.reader(handle, delimiter="\t"):
@@ -145,30 +183,69 @@ package_names = (
     "pytest",
     "ruff",
     "mypy",
+    "torch",
+    "transformers",
 )
 versions = {name: importlib.metadata.version(name) for name in package_names}
 config_path = Path("configs/v0.yaml")
-git_head = subprocess.run(
-    ["git", "rev-parse", "HEAD"],
+pyproject_path = Path("pyproject.toml")
+lock_path = Path("uv.lock")
+executable_paths = {
+    "python": Path(sys.executable).resolve(),
+    "uv": Path(shutil.which("uv") or "").resolve(),
+    "pytest": Path(shutil.which("pytest") or "").resolve(),
+    "ruff": Path(shutil.which("ruff") or "").resolve(),
+    "mypy": Path(shutil.which("mypy") or "").resolve(),
+}
+if any(not path.is_file() for path in executable_paths.values()):
+    raise RuntimeError("verification toolchain executable is missing")
+toolchain = {
+    name: {"path": str(path), "sha256": sha256_file(path)}
+    for name, path in executable_paths.items()
+}
+toolchain["uv"]["version"] = subprocess.run(
+    [str(executable_paths["uv"]), "--version"],
     check=True,
     capture_output=True,
     text=True,
 ).stdout.strip()
-git_status = subprocess.run(
-    ["git", "status", "--short"],
-    check=True,
-    capture_output=True,
-    text=True,
-).stdout.splitlines()
+toolchain["python"]["version"] = platform.python_version()
+trust_root = {
+    "git_head": expected_head,
+    "pyproject_sha256": sha256_file(pyproject_path),
+    "uv_lock_sha256": sha256_file(lock_path),
+    "config_sha256": sha256_file(config_path),
+    "verification_script_sha256": sha256_file(verification_script),
+    "python_executable_sha256": toolchain["python"]["sha256"],
+    "uv_executable_sha256": toolchain["uv"]["sha256"],
+    "pytest_executable_sha256": toolchain["pytest"]["sha256"],
+    "ruff_executable_sha256": toolchain["ruff"]["sha256"],
+    "mypy_executable_sha256": toolchain["mypy"]["sha256"],
+}
+output_relative_paths = (
+    "r1/fresh-environment-resolution.json",
+    "r2/pytest.txt",
+    "r2/algebra_probe.json",
+    "r3/synthetic_probe.json",
+)
+output_hashes = {
+    relative_path: sha256_file(temporary_root / relative_path)
+    for relative_path in output_relative_paths
+}
 report = {
-    "schema_version": 1,
+    "schema_version": 2,
     "rung": "R1",
     "status": "passed",
     "started_at": started_at,
     "completed_at": commands[-1]["completed_at"],
     "repository_root": str(Path.cwd()),
-    "git_head": git_head,
-    "git_status_porcelain": git_status,
+    "git_head": expected_head,
+    "repository_state": {
+        "start_head": expected_head,
+        "end_head": expected_head,
+        "start_clean": True,
+        "end_clean": True,
+    },
     "python": {
         "version": platform.python_version(),
         "implementation": platform.python_implementation(),
@@ -176,6 +253,8 @@ report = {
         "platform": platform.platform(),
     },
     "package_versions": versions,
+    "toolchain": toolchain,
+    "trust_root": trust_root,
     "config": {
         "path": str(config_path),
         "sha256": sha256_file(config_path),
@@ -190,90 +269,68 @@ report = {
     },
     "commands": commands,
     "artifacts": {
-        "r2_pytest": "artifacts/verification/r2/pytest.txt",
-        "r2_algebra": "artifacts/verification/r2/algebra_probe.json",
-        "r3_probe": "artifacts/verification/r3/synthetic_probe.json",
+        "r1_report": str(artifact_root / "r1" / "report.json"),
+        "fresh_environment_resolution": str(
+            artifact_root / "r1" / "fresh-environment-resolution.json"
+        ),
+        "r2_pytest": str(artifact_root / "r2" / "pytest.txt"),
+        "r2_algebra": str(artifact_root / "r2" / "algebra_probe.json"),
+        "r3_probe": str(artifact_root / "r3" / "synthetic_probe.json"),
+        "completion": str(artifact_root / "completion.json"),
     },
+    "output_sha256": output_hashes,
 }
-serialized = json.dumps(report, allow_nan=False, sort_keys=True).encode()
-report["report_content_sha256"] = hashlib.sha256(serialized).hexdigest()
+serialized = json.dumps(
+    report,
+    allow_nan=False,
+    separators=(",", ":"),
+    sort_keys=True,
+).encode()
+report["report_content_sha256"] = sha256_bytes(serialized)
 atomic_write_json(temporary_root / "r1" / "report.json", report)
 PY
 
-"${UV_BASE[@]}" python - "$TEMP_ROOT" <<'PY'
-import hashlib
+"${UV_BASE[@]}" python - \
+    "$TEMP_ROOT" "$ARTIFACT_ROOT" "$START_HEAD" "$REPO_ROOT" <<'PY'
 import json
-import re
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
-from self_improve_protein.config import load_protocol
-from self_improve_protein.probes import validate_synthetic_probe
-
-root = Path(sys.argv[1])
-report = json.loads((root / "r1" / "report.json").read_text(encoding="utf-8"))
-algebra = json.loads(
-    (root / "r2" / "algebra_probe.json").read_text(encoding="utf-8")
+from self_improve_protein.probes import (
+    build_verification_completion,
+    publish_verification_bundle,
+    require_clean_verification_git_state,
+    validate_verification_bundle,
 )
-probe = json.loads(
-    (root / "r3" / "synthetic_probe.json").read_text(encoding="utf-8")
-)
-pytest_output = (root / "r2" / "pytest.txt").read_text(encoding="utf-8")
-validate_synthetic_probe(probe)
-if report.get("status") != "passed" or report.get("rung") != "R1":
-    raise RuntimeError("R1 report did not pass schema validation")
-unsigned_report = dict(report)
-reported_content_digest = unsigned_report.pop("report_content_sha256", None)
-expected_content_digest = hashlib.sha256(
-    json.dumps(unsigned_report, allow_nan=False, sort_keys=True).encode()
-).hexdigest()
-if reported_content_digest != expected_content_digest:
-    raise RuntimeError("R1 report content digest is invalid")
-if not re.fullmatch(r"[0-9a-f]{40}", report.get("git_head", "")):
-    raise RuntimeError("R1 report git revision is invalid")
-commands = report.get("commands", [])
-expected_command_names = {
-    "r1_package_import",
-    "r1_locked_config",
-    "r1_cli_help",
-    "r1_ruff",
-    "r1_mypy",
-    "r2_targeted_pytest",
-    "r2_full_pytest",
-    "r3_synthetic_probe",
-}
-if {command.get("name") for command in commands} != expected_command_names:
-    raise RuntimeError("R1 report command set is incomplete")
-if any(command.get("exit_code") != 0 for command in commands):
-    raise RuntimeError("R1 report contains a failed command")
-if report["config"]["dump"] != load_protocol(
-    "configs/v0.yaml"
-).model_dump(mode="json"):
-    raise RuntimeError("R1 report config dump does not match the locked protocol")
-if algebra != probe["algebra"] or algebra["finite_checks"]["all"] is not True:
-    raise RuntimeError("R2 algebra artifact does not match the R3 probe")
-if pytest_output.count("exit_code=0") != 2:
-    raise RuntimeError("R2 pytest artifact does not record two passing commands")
-PY
 
-"${UV_BASE[@]}" python - "$TEMP_ROOT" "$ARTIFACT_ROOT" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-temporary_root = Path(sys.argv[1])
-artifact_root = Path(sys.argv[2])
-relative_paths = (
-    Path("r1/report.json"),
-    Path("r2/pytest.txt"),
-    Path("r2/algebra_probe.json"),
-    Path("r3/synthetic_probe.json"),
+temporary_root = Path(sys.argv[1]).resolve()
+artifact_root = Path(sys.argv[2]).resolve()
+expected_head = sys.argv[3]
+repository_root = Path(sys.argv[4]).resolve()
+require_clean_verification_git_state(
+    repository_root,
+    expected_head=expected_head,
 )
-for relative_path in relative_paths:
-    source = temporary_root / relative_path
-    destination = artifact_root / relative_path
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(source, destination)
+report = json.loads(
+    (temporary_root / "r1" / "report.json").read_text(encoding="utf-8")
+)
+completion = build_verification_completion(
+    temporary_root,
+    artifact_root=artifact_root,
+    git_head=expected_head,
+    trust_root=report["trust_root"],
+    published_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+)
+require_clean_verification_git_state(
+    repository_root,
+    expected_head=expected_head,
+)
+publish_verification_bundle(temporary_root, artifact_root, completion)
+validate_verification_bundle(
+    artifact_root,
+    expected_git_head=expected_head,
+)
 PY
 
 printf 'R1-R3 verification passed; artifacts: %s\n' "$ARTIFACT_ROOT"

@@ -1,21 +1,29 @@
 import copy
+import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from self_improve_protein import probes as probe_module
 from self_improve_protein.probes import (
     CAUSAL_DERIVATIVE_ERROR_TOLERANCE,
     CAUSAL_EPSILON,
     LEARNABILITY_PARAMETER_ERROR_TOLERANCE,
     LEARNABILITY_RIDGE_LAMBDA,
     LEARNABILITY_TRAIN_MSE_TOLERANCE,
+    build_verification_completion,
+    publish_verification_bundle,
+    require_clean_verification_git_state,
     run_synthetic_probe,
     validate_synthetic_probe,
+    validate_verification_bundle,
     write_synthetic_probe,
 )
+from self_improve_protein.provenance import atomic_write_json, sha256_file
 
 JsonObject = dict[str, object]
 
@@ -47,9 +55,7 @@ def test_seeded_noiseless_ridge_probe_is_learnable_at_declared_tolerances() -> N
     assert learnability["x_dtype"] == "float64"
     assert learnability["y_dtype"] == "float64"
     assert learnability["theta_dtype"] == "float64"
-    assert cast(float, learnability["train_mse"]) < (
-        LEARNABILITY_TRAIN_MSE_TOLERANCE
-    )
+    assert cast(float, learnability["train_mse"]) < (LEARNABILITY_TRAIN_MSE_TOLERANCE)
     assert cast(float, learnability["parameter_error_norm"]) < (
         LEARNABILITY_PARAMETER_ERROR_TOLERANCE
     )
@@ -72,8 +78,7 @@ def test_external_teacher_probe_matches_first_order_sign_and_order() -> None:
     assert len(set(scores)) == len(scores)
     assert min(scores) < 0.0 < max(scores)
     assert all(
-        abs(error) <= CAUSAL_DERIVATIVE_ERROR_TOLERANCE
-        for error in derivative_errors
+        abs(error) <= CAUSAL_DERIVATIVE_ERROR_TOLERANCE for error in derivative_errors
     )
     assert cast(bool, causal["first_order_signs_match"])
     assert cast(bool, causal["first_order_order_matches"])
@@ -188,8 +193,11 @@ def test_r1_r3_script_is_fail_fast_atomic_and_offline() -> None:
     assert "set -euo pipefail" in script
     assert "git rev-parse --show-toplevel" in script
     assert "mktemp -d" in script
-    assert "os.replace" in script
     assert "self-improve-protein --help" in script
+    assert "UV_BASE=(uv run --frozen --offline --extra dev --extra embed)" in script
+    assert "UV_PROJECT_ENVIRONMENT" in script
+    assert "uv sync --dry-run" in script
+    assert "r1_fresh_environment_resolution" in script
     assert "ruff check ." in script
     assert "mypy src" in script
     assert "tests/test_ridge.py" in script
@@ -201,6 +209,284 @@ def test_r1_r3_script_is_fail_fast_atomic_and_offline() -> None:
     assert "pytest -q" in script
     assert "self_improve_protein.probes" in script
     assert "allow_nan=False" in script
+    assert "git status --porcelain=v1 --untracked-files=all" in script
+    assert "START_HEAD" in script
+    assert "require_clean_verification_git_state" in script
+    assert "publish_verification_bundle" in script
+    assert "completion.json" in script
+    assert '"torch"' in script
+    assert '"transformers"' in script
+    assert "pyproject.toml" in script
+    assert "uv.lock" in script
+    assert "os.replace" in Path("src/self_improve_protein/probes.py").read_text(
+        encoding="utf-8"
+    )
     assert "curl " not in script
     assert "wget " not in script
     assert "sbatch " not in script
+
+
+def _staged_verification_bundle(
+    tmp_path: Path,
+    artifact_root: Path,
+    *,
+    include_transformers: bool = True,
+) -> tuple[Path, dict[str, object]]:
+    staging = artifact_root.parent / ".verification-staging"
+    (staging / "r1").mkdir(parents=True)
+    (staging / "r2").mkdir()
+    (staging / "r3").mkdir()
+    probe = run_synthetic_probe()
+    atomic_write_json(staging / "r3" / "synthetic_probe.json", probe)
+    atomic_write_json(staging / "r2" / "algebra_probe.json", probe["algebra"])
+    changes = [{"name": "torch", "version": "2.10.0", "action": "installed"}]
+    if include_transformers:
+        changes.append(
+            {
+                "name": "transformers",
+                "version": "4.57.6",
+                "action": "installed",
+            }
+        )
+    atomic_write_json(
+        staging / "r1" / "fresh-environment-resolution.json",
+        {
+            "sync": {
+                "action": "create",
+                "environment": {"path": str(staging / "fresh-environment")},
+                "changes": changes,
+            }
+        },
+    )
+    (staging / "r2" / "pytest.txt").write_text(
+        "targeted exit_code=0: 1 passed\nfull exit_code=0: 2 passed\n",
+        encoding="utf-8",
+    )
+    output_hashes = {
+        "r1/fresh-environment-resolution.json": sha256_file(
+            staging / "r1" / "fresh-environment-resolution.json"
+        ),
+        "r2/pytest.txt": sha256_file(staging / "r2" / "pytest.txt"),
+        "r2/algebra_probe.json": sha256_file(staging / "r2" / "algebra_probe.json"),
+        "r3/synthetic_probe.json": sha256_file(staging / "r3" / "synthetic_probe.json"),
+    }
+    trust_root = {
+        "git_head": "a" * 40,
+        "pyproject_sha256": "1" * 64,
+        "uv_lock_sha256": "2" * 64,
+        "config_sha256": "3" * 64,
+        "verification_script_sha256": "4" * 64,
+        "python_executable_sha256": "5" * 64,
+        "uv_executable_sha256": "6" * 64,
+        "pytest_executable_sha256": "7" * 64,
+        "ruff_executable_sha256": "8" * 64,
+        "mypy_executable_sha256": "9" * 64,
+    }
+    report = {
+        "schema_version": 2,
+        "rung": "R1",
+        "status": "passed",
+        "git_head": "a" * 40,
+        "repository_state": {
+            "start_head": "a" * 40,
+            "end_head": "a" * 40,
+            "start_clean": True,
+            "end_clean": True,
+        },
+        "trust_root": trust_root,
+        "toolchain": {
+            name: {"sha256": trust_root[f"{name}_executable_sha256"]}
+            for name in ("python", "uv", "pytest", "ruff", "mypy")
+        },
+        "config": {"sha256": trust_root["config_sha256"]},
+        "package_versions": {
+            "torch": "2.10.0",
+            "transformers": "4.57.6",
+        },
+        "commands": [
+            {"name": name, "exit_code": 0}
+            for name in (
+                "r1_fresh_environment_resolution",
+                "r1_package_import",
+                "r1_locked_config",
+                "r1_cli_help",
+                "r1_ruff",
+                "r1_mypy",
+                "r2_targeted_pytest",
+                "r2_full_pytest",
+                "r3_synthetic_probe",
+            )
+        ],
+        "artifacts": {
+            "r1_report": str(artifact_root / "r1" / "report.json"),
+            "fresh_environment_resolution": str(
+                artifact_root / "r1" / "fresh-environment-resolution.json"
+            ),
+            "r2_pytest": str(artifact_root / "r2" / "pytest.txt"),
+            "r2_algebra": str(artifact_root / "r2" / "algebra_probe.json"),
+            "r3_probe": str(artifact_root / "r3" / "synthetic_probe.json"),
+            "completion": str(artifact_root / "completion.json"),
+        },
+        "output_sha256": output_hashes,
+    }
+    report["report_content_sha256"] = hashlib.sha256(
+        json.dumps(
+            report,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    atomic_write_json(staging / "r1" / "report.json", report)
+    completion = build_verification_completion(
+        staging,
+        artifact_root=artifact_root,
+        git_head="a" * 40,
+        trust_root=trust_root,
+        published_at="2026-06-29T00:00:00Z",
+    )
+    return staging, completion
+
+
+def test_verification_bundle_custom_root_is_exact_and_completion_is_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_root = tmp_path / "custom-output" / "verification"
+    staging, completion = _staged_verification_bundle(tmp_path, artifact_root)
+    events: list[tuple[Path, Path]] = []
+    real_replace = probe_module.os.replace
+
+    def recording_replace(source: Path, destination: Path) -> None:
+        events.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(probe_module.os, "replace", recording_replace)
+
+    publish_verification_bundle(staging, artifact_root, completion)
+
+    loaded = validate_verification_bundle(
+        artifact_root,
+        expected_git_head="a" * 40,
+    )
+    assert loaded == completion
+    assert events[-1][1] == artifact_root / "completion.json"
+    assert json.loads(
+        (artifact_root / "r1" / "report.json").read_text(encoding="utf-8")
+    )["artifacts"] == {
+        "r1_report": str(artifact_root / "r1" / "report.json"),
+        "fresh_environment_resolution": str(
+            artifact_root / "r1" / "fresh-environment-resolution.json"
+        ),
+        "r2_pytest": str(artifact_root / "r2" / "pytest.txt"),
+        "r2_algebra": str(artifact_root / "r2" / "algebra_probe.json"),
+        "r3_probe": str(artifact_root / "r3" / "synthetic_probe.json"),
+        "completion": str(artifact_root / "completion.json"),
+    }
+    assert set(completion["output_sha256"]) == {
+        "r1/report.json",
+        "r1/fresh-environment-resolution.json",
+        "r2/pytest.txt",
+        "r2/algebra_probe.json",
+        "r3/synthetic_probe.json",
+    }
+
+
+def test_interrupted_publication_removes_authoritative_success_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_root = tmp_path / "verification"
+    artifact_root.mkdir()
+    atomic_write_json(artifact_root / "completion.json", {"status": "passed"})
+    staging, completion = _staged_verification_bundle(tmp_path, artifact_root)
+    real_replace = probe_module.os.replace
+
+    def fail_before_r2(source: Path, destination: Path) -> None:
+        if Path(source).name == "r2":
+            raise OSError("simulated interruption before R2 publication")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(probe_module.os, "replace", fail_before_r2)
+
+    with pytest.raises(OSError, match="simulated interruption"):
+        publish_verification_bundle(staging, artifact_root, completion)
+
+    assert not (artifact_root / "completion.json").exists()
+    with pytest.raises(ValueError, match="completion"):
+        validate_verification_bundle(artifact_root)
+
+
+def test_successful_publication_removes_stale_files_and_detects_tampering(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "verification"
+    stale = artifact_root / "r2" / "stale-success.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("obsolete\n", encoding="utf-8")
+    staging, completion = _staged_verification_bundle(tmp_path, artifact_root)
+
+    publish_verification_bundle(staging, artifact_root, completion)
+
+    assert not stale.exists()
+    validate_verification_bundle(artifact_root)
+    with (artifact_root / "r2" / "pytest.txt").open("a", encoding="utf-8") as handle:
+        handle.write("tampered\n")
+    with pytest.raises(ValueError, match="SHA-256"):
+        validate_verification_bundle(artifact_root)
+
+
+def test_fresh_environment_proof_requires_both_pinned_embed_dependencies(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "verification"
+
+    with pytest.raises(ValueError, match="embed dependencies"):
+        _staged_verification_bundle(
+            tmp_path,
+            artifact_root,
+            include_transformers=False,
+        )
+
+
+def test_clean_git_state_rejects_dirty_or_changed_head(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "probe@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Probe"],
+        cwd=repository,
+        check=True,
+    )
+    tracked = repository / "tracked.txt"
+    tracked.write_text("first\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "first"], cwd=repository, check=True)
+    first = require_clean_verification_git_state(repository)
+
+    untracked = repository / "untracked.txt"
+    untracked.write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="clean"):
+        require_clean_verification_git_state(repository, expected_head=first)
+    untracked.unlink()
+
+    tracked.write_text("second\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="clean"):
+        require_clean_verification_git_state(repository, expected_head=first)
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "second"], cwd=repository, check=True)
+    with pytest.raises(ValueError, match="HEAD changed"):
+        require_clean_verification_git_state(repository, expected_head=first)
+
+
+def test_audit_distinguishes_supervised_from_three_pseudo_methods() -> None:
+    audit = Path("docs/research/protocol-audit.md").read_text(encoding="utf-8")
+
+    assert "Three pseudo-label methods" in audit
+    assert "supervised-only method uses no pseudo-samples" in audit
+    assert "Four confirmatory methods differ only in selection" not in audit
