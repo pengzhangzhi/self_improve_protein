@@ -1,3 +1,4 @@
+import warnings
 from collections.abc import Callable
 from inspect import signature
 from typing import NoReturn, TypeAlias
@@ -112,6 +113,51 @@ def test_influence_is_negative_labeled_loss_derivative_for_multiple_candidates()
             -scores[candidate_index],
             rel=3e-5,
             abs=3e-7,
+        )
+
+
+def test_influence_rejects_overflowed_damped_system_without_warning() -> None:
+    x_l = np.array([[1e154]], dtype=np.float64)
+    y_l = np.array([0.0], dtype=np.float64)
+    x_u = np.array([[1.0]], dtype=np.float64)
+    yhat_u = np.array([0.0], dtype=np.float64)
+    theta = np.array([0.0], dtype=np.float64)
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError, match="damped Hessian system must be finite"):
+            influence_scores(
+                x_l,
+                y_l,
+                x_u,
+                yhat_u,
+                theta,
+                ridge_lambda=0.0,
+                damping=1e308,
+            )
+
+    assert caught_warnings == []
+
+
+def test_influence_reports_singular_damped_hessian_with_context() -> None:
+    x_l = np.array([[1.0, 2.0]], dtype=np.float64)
+    y_l = np.array([1.0], dtype=np.float64)
+    x_u = np.array([[3.0, 4.0]], dtype=np.float64)
+    yhat_u = np.array([2.0], dtype=np.float64)
+    theta = np.zeros(2, dtype=np.float64)
+
+    with pytest.raises(
+        np.linalg.LinAlgError,
+        match="damped Hessian system is singular",
+    ):
+        influence_scores(
+            x_l,
+            y_l,
+            x_u,
+            yhat_u,
+            theta,
+            ridge_lambda=0.0,
+            damping=0.0,
         )
 
 
@@ -305,18 +351,20 @@ def test_stable_top_k_rejects_invalid_inputs(
         stable_top_k(scores, hashes, k, largest=largest)  # type: ignore[arg-type]
 
 
-def test_random_indices_match_direct_pcg64_choice_and_are_sorted_unique() -> None:
-    pool_size = 23
-    k = 9
-    seed = 987654321
-    expected = np.sort(
-        np.random.Generator(np.random.PCG64(seed)).choice(
-            pool_size,
-            size=k,
-            replace=False,
-        )
-    ).astype(np.int64)
-
+@pytest.mark.parametrize(
+    ("pool_size", "k", "seed", "expected_values"),
+    [
+        (23, 9, 987654321, [3, 4, 5, 7, 12, 13, 17, 19, 22]),
+        (7, 3, 123, [0, 4, 6]),
+    ],
+)
+def test_random_indices_match_frozen_numpy_2_3_5_vectors(
+    pool_size: int,
+    k: int,
+    seed: int,
+    expected_values: list[int],
+) -> None:
+    expected = np.array(expected_values, dtype=np.int64)
     first = random_indices(pool_size, k, seed)
     second = random_indices(pool_size, k, seed)
 

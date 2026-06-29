@@ -19,6 +19,19 @@ def test_package_does_not_publish_console_script_before_cli_exists() -> None:
     assert "scripts" not in pyproject["project"]
 
 
+def test_random_selection_environment_exactly_pins_numpy() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    lockfile = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+
+    assert "numpy==2.3.5" in pyproject["project"]["dependencies"]
+    numpy_versions = {
+        package["version"]
+        for package in lockfile["package"]
+        if package["name"] == "numpy"
+    }
+    assert numpy_versions == {"2.3.5"}
+
+
 def test_v0_protocol_has_all_locked_values() -> None:
     protocol = load_protocol(CONFIG_PATH)
 

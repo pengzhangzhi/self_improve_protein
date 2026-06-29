@@ -114,11 +114,17 @@ def influence_scores(
         parameters,
     )
     hessian = _regularized_hessian(labeled_features, regularization)
-    system = hessian + damping_value * np.eye(
-        labeled_features.shape[1],
-        dtype=np.float64,
-    )
-    direction = np.linalg.solve(system, gradient)
+    with np.errstate(over="ignore"):
+        system = hessian + damping_value * np.eye(
+            labeled_features.shape[1],
+            dtype=np.float64,
+        )
+    if not np.all(np.isfinite(system)):
+        raise ValueError("damped Hessian system must be finite")
+    try:
+        direction = np.linalg.solve(system, gradient)
+    except np.linalg.LinAlgError as error:
+        raise np.linalg.LinAlgError("damped Hessian system is singular") from error
     residual = unlabeled_features @ parameters - pseudo_response
     scores = residual * (unlabeled_features @ direction) - gradient @ direction
     if not np.all(np.isfinite(scores)):

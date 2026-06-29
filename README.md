@@ -35,8 +35,11 @@ foundations. It makes no experimental-results claim.
 
 ## Development
 
-Python 3.11 or newer is required. Install development dependencies with
-`pip install -e '.[dev]'`, then run `pytest`, `ruff check .`, and `mypy src`.
+Python 3.11 or newer is required. Reproduce the executable development
+environment with `uv sync --frozen --extra dev`, then run `uv run pytest`,
+`uv run ruff check .`, and `uv run mypy src`. The tracked lockfile pins NumPy
+2.3.5 to freeze the `PCG64`/`Generator.choice` behavior used by the random
+selection baseline. As a local fallback, install with `pip install -e '.[dev]'`.
 
 The MIT license covers this repository's code. ProteinGym data and ESM model
 artifacts remain governed by their upstream terms and are not redistributed
