@@ -1,0 +1,5 @@
+mutant,mutated_sequence,DMS_score,DMS_score_bin
+A1C,CADE,1.0,1
+A2D,ADDE,2.0,1
+A3E,ACEE,3.0,1
+A4F,ACDF,4.0,1
