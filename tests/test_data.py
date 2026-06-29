@@ -4,12 +4,14 @@ import json
 import zipfile
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
 import pytest
 from pydantic import ValidationError
 
+from self_improve_protein import data as data_module
 from self_improve_protein.data import (
     AssayEligibility,
     DataManifest,
@@ -376,6 +378,71 @@ def test_load_assay_uses_exact_v13_member_layout_without_extracting(
     assert merged["mutant"].tolist() == ["A1C", "A2D", "A3E", "A4F"]
     assert merged[TEACHER].tolist() == pytest.approx([0.1, 0.2, 0.3, 0.4])
     assert sorted(path.name for path in tmp_path.iterdir()) == ["dms.zip", "scores.zip"]
+
+
+def test_load_assay_projects_required_columns_during_csv_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dms_zip, scores_zip = _write_fixture_archives(
+        tmp_path,
+        "DMS_ProteinGym_substitutions/TINY.csv",
+        "TINY.csv",
+    )
+    read_csv = Mock(wraps=data_module.pd.read_csv)
+    monkeypatch.setattr(data_module.pd, "read_csv", read_csv)
+
+    merged = load_assay_from_archives(dms_zip, scores_zip, "TINY", TEACHER)
+
+    assert [entry.kwargs.get("usecols") for entry in read_csv.call_args_list] == [
+        ("mutant", "mutated_sequence", "DMS_score"),
+        ("mutant", TEACHER),
+    ]
+    assert merged.columns.tolist() == [
+        "mutant",
+        "mutated_sequence",
+        "DMS_score",
+        "source_row",
+        "dms_id",
+        TEACHER,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("archive_kind", "csv_payload", "missing_column"),
+    [
+        (
+            "dms",
+            b"mutant,DMS_score\nA1C,1.0\n",
+            "mutated_sequence",
+        ),
+        (
+            "scores",
+            b"mutant,unused_teacher\nA1C,0.1\n",
+            TEACHER,
+        ),
+    ],
+)
+def test_load_assay_projection_rejects_missing_required_columns(
+    tmp_path: Path,
+    archive_kind: str,
+    csv_payload: bytes,
+    missing_column: str,
+) -> None:
+    dms_zip, scores_zip = _write_fixture_archives(
+        tmp_path,
+        "DMS_ProteinGym_substitutions/TINY.csv",
+        "TINY.csv",
+    )
+    archive_path = dms_zip if archive_kind == "dms" else scores_zip
+    member = (
+        "DMS_ProteinGym_substitutions/TINY.csv" if archive_kind == "dms" else "TINY.csv"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(member, csv_payload)
+
+    with pytest.raises(ValueError, match=missing_column):
+        load_assay_from_archives(dms_zip, scores_zip, "TINY", TEACHER)
 
 
 @pytest.mark.parametrize(

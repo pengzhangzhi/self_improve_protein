@@ -244,6 +244,7 @@ def build_working_set(usable: pd.DataFrame, size: int) -> pd.DataFrame:
 def _read_exact_csv_member(
     archive_path: Path | str,
     member_name: str,
+    usecols: tuple[str, ...],
 ) -> pd.DataFrame:
     with zipfile.ZipFile(archive_path) as archive:
         matches = [
@@ -255,7 +256,7 @@ def _read_exact_csv_member(
                 f"found {len(matches)}"
             )
         with archive.open(matches[0]) as source:
-            return pd.read_csv(source)
+            return pd.read_csv(source, usecols=usecols)
 
 
 def load_assay_from_archives(
@@ -267,8 +268,16 @@ def load_assay_from_archives(
     """Load and join one assay directly from the pinned v1.3 ZIP layouts."""
     dms_member = f"DMS_ProteinGym_substitutions/{dms_id}.csv"
     score_member = f"{dms_id}.csv"
-    dms_frame = _read_exact_csv_member(dms_zip, dms_member)
-    score_frame = _read_exact_csv_member(scores_zip, score_member)
+    dms_frame = _read_exact_csv_member(
+        dms_zip,
+        dms_member,
+        _DMS_REQUIRED_COLUMNS,
+    )
+    score_frame = _read_exact_csv_member(
+        scores_zip,
+        score_member,
+        ("mutant", teacher_column),
+    )
     return merge_assay_frames(dms_frame, score_frame, dms_id, teacher_column)
 
 
