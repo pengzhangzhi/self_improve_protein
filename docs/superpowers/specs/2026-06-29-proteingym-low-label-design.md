@@ -4,6 +4,8 @@
 
 **Pre-outcome amendment (2026-06-29):** Inspection of the v1.3 merged files corrected the literal teacher column from the upstream input-score name `Ensemble_ESM1v` to the distributed merged-column name `ESM1v_ensemble`. The source was pinned to Zenodo record `15293562` because ProteinGymPy 0.9.3 still points its zero-shot loader at v1.2. No method outcome had been computed.
 
+**Pre-outcome provenance amendment (2026-06-29):** The ProteinGym tag `PG_v1.3` was peeled to upstream commit `1f8de974dead8ff7501eff087b725d14a965e9f9`; the Zenodo metadata was confirmed byte-identical at SHA-256 `a8f498011532a74aa9fe556a50555a75e928c5837d19c06a87592ae04049b308`. The representation is pinned to ESM-2 revision `6fbf070e65b0b7291e7bbcd451118c216cff79d8`. These values and all three source-archive digests were written into the strict protocol before embedding. No method outcome had been evaluated.
+
 ## Research goal contract
 
 The research outcome is a defensible yes/no answer to whether the proposed first-order score chooses externally pseudo-labeled protein variants that improve low-label DMS fitness ranking relative to random selection. The evidence bar is a predeclared 8-assay by 5-seed study with a locked primary metric, followed by an untouched-assay replication if the result is positive or ambiguous. A green software test suite is necessary but is not evidence for the method.

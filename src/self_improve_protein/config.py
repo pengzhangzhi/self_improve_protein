@@ -1,10 +1,26 @@
 """Validated, immutable experiment protocol loading."""
 
 from pathlib import Path
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StringConstraints,
+    model_validator,
+)
+
+GitCommit = Annotated[
+    str,
+    StringConstraints(strict=True, pattern=r"^[0-9a-f]{40}$"),
+]
+Sha256Hex = Annotated[
+    str,
+    StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
+]
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -62,8 +78,13 @@ class Protocol(BaseModel):
     substitutions_url: str = Field(min_length=1)
     zero_shot_scores_url: str = Field(min_length=1)
     metadata_url: str = Field(min_length=1)
+    proteingym_upstream_commit: GitCommit
+    substitutions_sha256: Sha256Hex
+    zero_shot_scores_sha256: Sha256Hex
+    metadata_sha256: Sha256Hex
     teacher_column: str = Field(min_length=1)
     model: str = Field(min_length=1)
+    model_revision: GitCommit
 
     working_size: int = Field(gt=0, strict=True)
     n_labeled: int = Field(gt=0, strict=True)

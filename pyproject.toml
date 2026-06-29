@@ -26,8 +26,8 @@ dependencies = [
 
 [project.optional-dependencies]
 embed = [
-    "torch",
-    "transformers<5",
+    "torch==2.10.0",
+    "transformers==4.57.6",
 ]
 dev = [
     "pytest",

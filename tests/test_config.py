@@ -32,6 +32,26 @@ def test_random_selection_environment_exactly_pins_numpy() -> None:
     assert numpy_versions == {"2.3.5"}
 
 
+def test_embedding_environment_exactly_pins_torch_and_transformers() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    lockfile = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+
+    assert set(pyproject["project"]["optional-dependencies"]["embed"]) == {
+        "torch==2.10.0",
+        "transformers==4.57.6",
+    }
+    for name, expected_version in {
+        "torch": "2.10.0",
+        "transformers": "4.57.6",
+    }.items():
+        versions = {
+            package["version"]
+            for package in lockfile["package"]
+            if package["name"] == name
+        }
+        assert versions == {expected_version}
+
+
 def test_v0_protocol_has_all_locked_values() -> None:
     protocol = load_protocol(CONFIG_PATH)
 
@@ -65,6 +85,23 @@ def test_v0_protocol_has_official_sources_and_preprocessing() -> None:
     assert protocol.metadata_url == (
         "https://zenodo.org/api/records/15293562/files/"
         "DMS_substitutions.csv/content"
+    )
+    assert (
+        protocol.proteingym_upstream_commit
+        == "1f8de974dead8ff7501eff087b725d14a965e9f9"
+    )
+    assert protocol.model_revision == "6fbf070e65b0b7291e7bbcd451118c216cff79d8"
+    assert (
+        protocol.substitutions_sha256
+        == "3a83766254ac9ac9984ec25cb73c6e010ea4418f5e35f143933e6b6e6473b921"
+    )
+    assert (
+        protocol.zero_shot_scores_sha256
+        == "3fd7cdb5e78f1d43cabfabfeb6578c252b63af23ba2ab44db0094dc3a42de36d"
+    )
+    assert (
+        protocol.metadata_sha256
+        == "a8f498011532a74aa9fe556a50555a75e928c5837d19c06a87592ae04049b308"
     )
     assert protocol.preprocessing.feature_scaling == "scalar_rms"
     assert protocol.preprocessing.student_fit == "no_intercept"
@@ -183,6 +220,31 @@ def test_protocol_rejects_duplicate_seeds() -> None:
 def test_protocol_rejects_unknown_fields() -> None:
     data = _protocol_data()
     data["unlocked_override"] = True
+
+    with pytest.raises(ValidationError):
+        Protocol.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "length"),
+    [
+        ("proteingym_upstream_commit", 40),
+        ("model_revision", 40),
+        ("substitutions_sha256", 64),
+        ("zero_shot_scores_sha256", 64),
+        ("metadata_sha256", 64),
+    ],
+)
+@pytest.mark.parametrize("invalid", [True, 1, "ABCDEF"])
+def test_protocol_rejects_non_strict_or_malformed_revision_and_digest_fields(
+    field: str,
+    length: int,
+    invalid: object,
+) -> None:
+    data = _protocol_data()
+    if invalid == "ABCDEF":
+        invalid = "A" * length
+    data[field] = invalid
 
     with pytest.raises(ValidationError):
         Protocol.model_validate(data)
