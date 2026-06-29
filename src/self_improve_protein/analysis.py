@@ -149,8 +149,8 @@ class PairwiseSummary:
 
 
 @dataclass(frozen=True)
-class AnalysisVerdict:
-    """Primary-only selection and practical-self-improvement decisions."""
+class V0AnalysisVerdict:
+    """Locked v0 selection and practical-self-improvement decisions."""
 
     selection_success: bool
     practical_self_improvement: bool
@@ -162,6 +162,30 @@ class AnalysisVerdict:
             raise ValueError("selection_success must be a boolean")
         if type(self.practical_self_improvement) is not bool:
             raise ValueError("practical_self_improvement must be a boolean")
+        if (
+            self.ours_minus_random.first != "ours"
+            or self.ours_minus_random.second != "random"
+            or self.ours_minus_supervised.first != "ours"
+            or self.ours_minus_supervised.second != "supervised"
+        ):
+            raise ValueError("v0 verdict comparisons are locked")
+        for summary in (self.ours_minus_random, self.ours_minus_supervised):
+            if summary.metric != "spearman":
+                raise ValueError("v0 verdict metric is locked to Spearman")
+            if summary.task_total != 40 or summary.assay_total != 8:
+                raise ValueError("v0 verdict requires exactly 40 tasks and 8 assays")
+        expected_selection = (
+            self.ours_minus_random.mean_gain > 0.0
+            and self.ours_minus_random.task_wins >= 25
+            and self.ours_minus_random.assay_wins >= 5
+        )
+        expected_practical = self.ours_minus_supervised.mean_gain > 0.0
+        if self.selection_success != expected_selection:
+            raise ValueError("selection_success must use the locked v0 rule")
+        if self.practical_self_improvement != expected_practical:
+            raise ValueError(
+                "practical_self_improvement must use ours-minus-supervised Spearman"
+            )
 
 
 def _string_tuple(values: Sequence[str], *, name: str) -> tuple[str, ...]:
@@ -560,53 +584,71 @@ def comparison_summary_table(
     return pd.DataFrame(rows)
 
 
-def analysis_verdict(
-    results: pd.DataFrame,
-    *,
-    ours_method: str = "ours",
-    random_method: str = "random",
-    supervised_method: str = "supervised",
-    minimum_task_wins: int = 25,
-    minimum_assay_wins: int = 5,
-) -> AnalysisVerdict:
-    """Apply the primary-only selection rule and separate practical criterion.
+def _validate_v0_verdict_grid(results: pd.DataFrame) -> None:
+    """Require the locked four-method, 8-assay by 5-seed v0 grid."""
+    if not isinstance(results, pd.DataFrame):
+        raise ValueError("results must be a pandas DataFrame")
+    needed = (*_KEY_COLUMNS, "spearman")
+    missing_columns = [column for column in needed if column not in results.columns]
+    if missing_columns:
+        raise ValueError(f"results missing required columns: {missing_columns}")
+    confirmatory = results.loc[results["method"].isin(CONFIRMATORY_METHODS), needed]
+    if bool(confirmatory.duplicated(list(_KEY_COLUMNS), keep=False).any()):
+        raise ValueError("duplicate confirmatory assay-seed-method rows")
+    present_methods = set(confirmatory["method"])
+    if present_methods != set(CONFIRMATORY_METHODS):
+        raise ValueError("v0 verdict requires all four confirmatory methods")
+
+    method_keys: dict[str, set[tuple[object, object]]] = {}
+    for method in CONFIRMATORY_METHODS:
+        rows = confirmatory.loc[
+            confirmatory["method"] == method,
+            ["assay_id", "seed"],
+        ]
+        method_keys[method] = set(rows.itertuples(index=False, name=None))
+    reference_keys = method_keys["ours"]
+    if any(keys != reference_keys for keys in method_keys.values()):
+        raise ValueError("v0 confirmatory methods must have identical paired tasks")
+
+    assay_counts = (
+        confirmatory.loc[confirmatory["method"] == "ours"]
+        .groupby("assay_id", sort=False)["seed"]
+        .nunique()
+    )
+    if (
+        len(reference_keys) != 40
+        or assay_counts.size != 8
+        or not bool((assay_counts == 5).all())
+    ):
+        raise ValueError("v0 verdict requires exactly 40 paired tasks and 8 assays")
+
+
+def v0_analysis_verdict(results: pd.DataFrame) -> V0AnalysisVerdict:
+    """Apply the immutable primary-only v0 rules.
 
     ``results`` must be the complete output of :func:`validate_result_table` or
     :func:`validate_v0_result_table`.
     """
-    task_threshold = _strict_int(
-        minimum_task_wins,
-        name="minimum_task_wins",
-        minimum=0,
-    )
-    assay_threshold = _strict_int(
-        minimum_assay_wins,
-        name="minimum_assay_wins",
-        minimum=0,
-    )
+    _validate_v0_verdict_grid(results)
     versus_random = pairwise_summary(
         results,
-        first=ours_method,
-        second=random_method,
+        first="ours",
+        second="random",
         metric="spearman",
     )
     versus_supervised = pairwise_summary(
         results,
-        first=ours_method,
-        second=supervised_method,
+        first="ours",
+        second="supervised",
         metric="spearman",
     )
-    if task_threshold > versus_random.task_total:
-        raise ValueError("minimum_task_wins must not exceed task_total")
-    if assay_threshold > versus_random.assay_total:
-        raise ValueError("minimum_assay_wins must not exceed assay_total")
     selection_success = (
         versus_random.mean_gain > 0.0
-        and versus_random.task_wins >= task_threshold
-        and versus_random.assay_wins >= assay_threshold
+        and versus_random.task_wins >= 25
+        and versus_random.assay_wins >= 5
     )
     practical = versus_supervised.mean_gain > 0.0
-    return AnalysisVerdict(
+    return V0AnalysisVerdict(
         selection_success=selection_success,
         practical_self_improvement=practical,
         ours_minus_random=versus_random,

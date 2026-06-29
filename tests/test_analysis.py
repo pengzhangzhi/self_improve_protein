@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError
+from inspect import signature
 
 import numpy as np
 import pandas as pd
@@ -10,12 +11,12 @@ from self_improve_protein.analysis import (
     NO_HESSIAN_METHOD,
     BootstrapInterval,
     PairwiseSummary,
-    analysis_verdict,
     comparison_summary_table,
     exact_sign_flip_pvalue,
     hierarchical_bootstrap_interval,
     method_summary_table,
     pairwise_summary,
+    v0_analysis_verdict,
     validate_result_table,
     validate_v0_result_table,
 )
@@ -276,14 +277,18 @@ def test_compact_method_and_comparison_tables_are_assay_macro() -> None:
     assert random_row["assay_wins"] == 6
 
 
-def test_verdict_separates_selection_success_from_practical_improvement() -> None:
+def test_v0_verdict_signature_does_not_expose_methods_or_thresholds() -> None:
+    assert tuple(signature(v0_analysis_verdict).parameters) == ("results",)
+
+
+def test_v0_verdict_separates_selection_success_from_practical_improvement() -> None:
     positive_selection = validate_result_table(
         _complete_results(practical_gain=-0.03),
         assay_ids=ASSAYS,
         seeds=SEEDS,
     )
 
-    verdict = analysis_verdict(positive_selection)
+    verdict = v0_analysis_verdict(positive_selection)
 
     assert verdict.selection_success is True
     assert verdict.practical_self_improvement is False
@@ -303,10 +308,120 @@ def test_secondary_metrics_or_supervised_gain_cannot_rescue_primary_failure() ->
     table.loc[supervised, "spearman"] = table.loc[ours, "spearman"].to_numpy() - 0.5
     validated = validate_result_table(table, assay_ids=ASSAYS, seeds=SEEDS)
 
-    verdict = analysis_verdict(validated)
+    verdict = v0_analysis_verdict(validated)
 
     assert verdict.selection_success is False
     assert verdict.practical_self_improvement is True
+
+
+@pytest.mark.parametrize("assay_count", [7, 9])
+def test_v0_verdict_requires_exactly_40_tasks_and_8_assays(assay_count: int) -> None:
+    table = _complete_results()
+    if assay_count == 7:
+        table = table.loc[table["assay_id"].isin(ASSAYS[:7])].copy()
+    else:
+        extra = table.loc[table["assay_id"] == ASSAYS[0]].copy()
+        extra["assay_id"] = "assay_8"
+        table = pd.concat([table, extra], ignore_index=True)
+
+    with pytest.raises(ValueError, match=r"exactly 40.*8 assays"):
+        v0_analysis_verdict(table)
+
+
+def test_v0_verdict_hard_codes_25_task_win_threshold() -> None:
+    table = _complete_results()
+    deltas = {
+        ASSAYS[0]: (0.2, 0.2, 0.2, 0.2, 0.2),
+        ASSAYS[1]: (0.2, 0.2, 0.2, 0.2, 0.2),
+        ASSAYS[2]: (0.2, 0.2, 0.2, 0.2, 0.2),
+        ASSAYS[3]: (0.2, 0.2, 0.2, 0.2, 0.2),
+        ASSAYS[4]: (0.2, 0.2, 0.2, 0.2, -0.05),
+        ASSAYS[5]: (-0.05, -0.05, -0.05, -0.05, -0.05),
+        ASSAYS[6]: (-0.05, -0.05, -0.05, -0.05, -0.05),
+        ASSAYS[7]: (-0.05, -0.05, -0.05, -0.05, -0.05),
+    }
+    for assay_id, assay_deltas in deltas.items():
+        for seed, delta in zip(SEEDS, assay_deltas, strict=True):
+            random_mask = (
+                (table["assay_id"] == assay_id)
+                & (table["seed"] == seed)
+                & (table["method"] == "random")
+            )
+            random_value = float(table.loc[random_mask, "spearman"].iloc[0])
+            ours_mask = (
+                (table["assay_id"] == assay_id)
+                & (table["seed"] == seed)
+                & (table["method"] == "ours")
+            )
+            supervised_mask = (
+                (table["assay_id"] == assay_id)
+                & (table["seed"] == seed)
+                & (table["method"] == "supervised")
+            )
+            table.loc[ours_mask, "spearman"] = random_value + delta
+            table.loc[supervised_mask, "spearman"] = random_value + delta - 0.01
+
+    verdict = v0_analysis_verdict(table)
+
+    assert verdict.ours_minus_random.mean_gain > 0.0
+    assert verdict.ours_minus_random.task_wins == 24
+    assert verdict.ours_minus_random.assay_wins == 5
+    assert verdict.selection_success is False
+    assert verdict.practical_self_improvement is True
+
+
+def test_v0_verdict_hard_codes_five_assay_win_threshold() -> None:
+    table = _complete_results()
+    deltas = {
+        ASSAYS[0]: (0.2, 0.2, 0.2, 0.2, 0.2),
+        ASSAYS[1]: (0.2, 0.2, 0.2, 0.2, 0.2),
+        ASSAYS[2]: (0.2, 0.2, 0.2, 0.2, 0.2),
+        ASSAYS[3]: (0.2, 0.2, 0.2, 0.2, 0.2),
+        ASSAYS[4]: (0.01, 0.01, -0.1, -0.1, -0.1),
+        ASSAYS[5]: (0.01, -0.1, -0.1, -0.1, -0.1),
+        ASSAYS[6]: (0.01, -0.1, -0.1, -0.1, -0.1),
+        ASSAYS[7]: (0.01, -0.1, -0.1, -0.1, -0.1),
+    }
+    for assay_id, assay_deltas in deltas.items():
+        for seed, delta in zip(SEEDS, assay_deltas, strict=True):
+            base_mask = (
+                (table["assay_id"] == assay_id)
+                & (table["seed"] == seed)
+                & (table["method"] == "random")
+            )
+            random_value = float(table.loc[base_mask, "spearman"].iloc[0])
+            ours_mask = (
+                (table["assay_id"] == assay_id)
+                & (table["seed"] == seed)
+                & (table["method"] == "ours")
+            )
+            supervised_mask = (
+                (table["assay_id"] == assay_id)
+                & (table["seed"] == seed)
+                & (table["method"] == "supervised")
+            )
+            table.loc[ours_mask, "spearman"] = random_value + delta
+            table.loc[supervised_mask, "spearman"] = random_value + delta - 0.01
+
+    verdict = v0_analysis_verdict(table)
+
+    assert verdict.ours_minus_random.mean_gain > 0.0
+    assert verdict.ours_minus_random.task_wins == 25
+    assert verdict.ours_minus_random.assay_wins == 4
+    assert verdict.selection_success is False
+
+
+def test_no_hessian_rows_cannot_alter_v0_verdict() -> None:
+    table = _complete_results()
+    baseline = v0_analysis_verdict(table)
+    no_hessian = table.loc[table["method"] == "ours"].copy()
+    no_hessian["method"] = NO_HESSIAN_METHOD
+    no_hessian["spearman"] = 1e6
+    no_hessian["mse"] = -1e6
+    no_hessian["ndcg_10pct"] = 1e6
+    extended = pd.concat([table, no_hessian], ignore_index=True)
+
+    assert v0_analysis_verdict(extended) == baseline
 
 
 @pytest.mark.parametrize(
