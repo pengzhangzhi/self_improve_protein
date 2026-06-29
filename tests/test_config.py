@@ -258,6 +258,15 @@ def test_development_pilot_expects_five_methods_by_two_seeds() -> None:
     assert "Expected: eight method rows total" not in plan
 
 
+def test_task_plan_requires_external_fit_digest_and_names_oracle_precisely() -> None:
+    plan = Path(
+        "docs/superpowers/plans/2026-06-29-proteingym-v0-implementation.md"
+    ).read_text(encoding="utf-8")
+    assert "expected_fit_digest" in plan
+    assert "test-risk oracle influence" in plan
+    assert "frozen teacher pseudo-gradient" in plan
+
+
 def test_protocol_rejects_unknown_fields() -> None:
     data = _protocol_data()
     data["unlocked_override"] = True

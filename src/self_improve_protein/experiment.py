@@ -55,6 +55,51 @@ METHOD_NAMES: tuple[MethodName, ...] = (
     "no_hessian",
 )
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_IDENTITY_FIELDS = (
+    "data_release",
+    "substitutions_url",
+    "zero_shot_scores_url",
+    "metadata_url",
+    "proteingym_upstream_commit",
+    "substitutions_sha256",
+    "zero_shot_scores_sha256",
+    "metadata_sha256",
+    "teacher_column",
+    "model",
+    "model_revision",
+    "max_length",
+)
+
+
+def _canonical_payload_digest(payload: object) -> str:
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "canonical payload must be finite and JSON serializable"
+        ) from error
+    return sha256_bytes(encoded)
+
+
+def canonical_protocol_digest(protocol: Protocol) -> str:
+    """Hash every field of one validated immutable protocol canonically."""
+    if not isinstance(protocol, Protocol):
+        raise ValueError("protocol must be Protocol")
+    return _canonical_payload_digest(protocol.model_dump(mode="json"))
+
+
+def canonical_source_digest(protocol: Protocol) -> str:
+    """Hash only pinned ProteinGym, teacher, and embedding source identity."""
+    if not isinstance(protocol, Protocol):
+        raise ValueError("protocol must be Protocol")
+    protocol_payload = protocol.model_dump(mode="json")
+    payload = {field: protocol_payload[field] for field in _SOURCE_IDENTITY_FIELDS}
+    return _canonical_payload_digest(payload)
 
 
 def _identity(assay_id: str, seed: int, source_digest: str) -> tuple[str, int, str]:
@@ -241,6 +286,38 @@ class EvaluationLabels:
 
 
 @dataclass(frozen=True)
+class CorrelationDiagnostic:
+    defined: bool
+    value: float | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class CosineDiagnostic:
+    defined: bool
+    value: float | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class TeacherScoreDiagnostics:
+    count: int
+    finite_count: int
+    finite_fraction: float
+    variance: float
+
+
+@dataclass(frozen=True)
+class DistributionDiagnostics:
+    count: int
+    minimum: float
+    maximum: float
+    mean: float
+    standard_deviation: float
+    quantiles: tuple[float, float, float, float, float]
+
+
+@dataclass(frozen=True)
 class ScoreDiagnostics:
     minimum: float
     maximum: float
@@ -249,8 +326,8 @@ class ScoreDiagnostics:
     quantiles: tuple[float, float, float, float, float]
     positive_fraction: float
     unique_count: int
-    mean_selected_ours: float
-    maximum_selected_ours: float
+    mean_selected_method: float
+    maximum_selected_method: float
     mean_selected_random: float
 
 
@@ -272,6 +349,7 @@ class MethodFitDiagnostics:
     first_order_labeled_loss_change: float | None
     realized_labeled_loss_change: float | None
     displacement_cosine: float | None
+    displacement_cosine_defined: bool
     displacement_relative_error: float | None
     locality_index: float | None
 
@@ -285,6 +363,11 @@ class FitDiagnostics:
     calibration_slope: float
     calibration_intercept: float
     calibration_labeled_rmse: float
+    calibration_labeled_spearman: CorrelationDiagnostic
+    teacher_scores_labeled: TeacherScoreDiagnostics
+    teacher_scores_unlabeled: TeacherScoreDiagnostics
+    teacher_scores_test: TeacherScoreDiagnostics
+    teacher_student_unlabeled_residual: DistributionDiagnostics
     supervised_stationarity_identity_residual: float
     full_score: ScoreDiagnostics
     no_hessian_score: ScoreDiagnostics
@@ -361,6 +444,7 @@ class FitResult:
     assay_id: str
     seed: int
     source_digest: str
+    protocol_digest: str
     labeled_hashes: tuple[str, ...]
     unlabeled_hashes: tuple[str, ...]
     test_hashes: tuple[str, ...]
@@ -394,6 +478,7 @@ class FitResult:
             "assay_id": self.assay_id,
             "seed": self.seed,
             "source_digest": self.source_digest,
+            "protocol_digest": self.protocol_digest,
             "labeled_hashes": list(self.labeled_hashes),
             "unlabeled_hashes": list(self.unlabeled_hashes),
             "test_hashes": list(self.test_hashes),
@@ -447,16 +532,16 @@ class FitResult:
         }
 
 
+def _canonical_fit_digest_unchecked(result: FitResult) -> str:
+    return _canonical_payload_digest(result.to_payload())
+
+
 def canonical_fit_digest(result: FitResult) -> str:
-    """Hash the deterministic, hidden-label-free canonical fit payload."""
+    """Validate and hash the deterministic, hidden-label-free fit payload."""
+    if not isinstance(result, FitResult):
+        raise ValueError("result must be FitResult")
     _validate_fit_integrity(result)
-    payload = json.dumps(
-        result.to_payload(),
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return sha256_bytes(payload)
+    return _canonical_fit_digest_unchecked(result)
 
 
 def _score_diagnostics(
@@ -477,8 +562,8 @@ def _score_diagnostics(
         quantiles=quantiles,  # type: ignore[arg-type]
         positive_fraction=float(np.mean(scores > 0.0)),
         unique_count=int(np.unique(scores).size),
-        mean_selected_ours=float(np.mean(selected_array)),
-        maximum_selected_ours=float(np.max(selected_array)),
+        mean_selected_method=float(np.mean(selected_array)),
+        maximum_selected_method=float(np.max(selected_array)),
         mean_selected_random=float(np.mean(random_array)),
     )
 
@@ -508,11 +593,18 @@ def _matrix_diagnostics(
     )
 
 
-def _cosine(first: FloatArray, second: FloatArray) -> float:
+def _cosine_diagnostic(
+    first: FloatArray,
+    second: FloatArray,
+) -> CosineDiagnostic:
     denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
     if denominator <= np.finfo(np.float64).tiny:
-        return 0.0
-    return float(np.clip(first @ second / denominator, -1.0, 1.0))
+        return CosineDiagnostic(False, None, "zero_norm")
+    return CosineDiagnostic(
+        True,
+        float(np.clip(first @ second / denominator, -1.0, 1.0)),
+        None,
+    )
 
 
 def _locality_index(
@@ -572,6 +664,7 @@ def _method_diagnostics(
             first_order_labeled_loss_change=None,
             realized_labeled_loss_change=None,
             displacement_cosine=None,
+            displacement_cosine_defined=False,
             displacement_relative_error=None,
             locality_index=None,
         )
@@ -592,6 +685,10 @@ def _method_diagnostics(
         np.linalg.norm(realized_displacement - predicted_displacement)
         / max(realized_norm, tiny)
     )
+    displacement_cosine = _cosine_diagnostic(
+        predicted_displacement,
+        realized_displacement,
+    )
     return MethodFitDiagnostics(
         name=method.name,
         stationarity_residual=stationarity_residual,
@@ -601,9 +698,111 @@ def _method_diagnostics(
             squared_loss(x_l, y_l, method.coefficients)
             - squared_loss(x_l, y_l, theta_zero)
         ),
-        displacement_cosine=_cosine(predicted_displacement, realized_displacement),
+        displacement_cosine=displacement_cosine.value,
+        displacement_cosine_defined=displacement_cosine.defined,
         displacement_relative_error=relative_error,
         locality_index=_locality_index(x_l, x_selected, hessian, t),
+    )
+
+
+def _teacher_score_diagnostics(scores: FloatArray) -> TeacherScoreDiagnostics:
+    finite_count = int(np.count_nonzero(np.isfinite(scores)))
+    return TeacherScoreDiagnostics(
+        count=int(scores.size),
+        finite_count=finite_count,
+        finite_fraction=float(finite_count / scores.size),
+        variance=float(np.var(scores)),
+    )
+
+
+def _distribution_diagnostics(values: FloatArray) -> DistributionDiagnostics:
+    quantiles = tuple(
+        float(value) for value in np.quantile(values, [0.0, 0.25, 0.5, 0.75, 1.0])
+    )
+    return DistributionDiagnostics(
+        count=int(values.size),
+        minimum=float(np.min(values)),
+        maximum=float(np.max(values)),
+        mean=float(np.mean(values)),
+        standard_deviation=float(np.std(values)),
+        quantiles=quantiles,  # type: ignore[arg-type]
+    )
+
+
+def _build_fit_diagnostics(
+    *,
+    feature_transform: FeatureTransform,
+    label_transform: LabelTransform,
+    calibration: TeacherCalibration,
+    z_l: FloatArray,
+    z_u: FloatArray,
+    z_test: FloatArray,
+    x_l: FloatArray,
+    y_l: FloatArray,
+    x_u: FloatArray,
+    pseudo_labels_u: FloatArray,
+    theta_zero: FloatArray,
+    full_scores: FloatArray,
+    no_h_scores: FloatArray,
+    selections: dict[MethodName, tuple[int, ...]],
+    methods: Sequence[MethodArtifact],
+    q: int,
+    pseudo_weight: float,
+    ridge_lambda: float,
+) -> FitDiagnostics:
+    gradient, hessian = labeled_gradient_hessian(
+        x_l,
+        y_l,
+        theta_zero,
+        ridge_lambda,
+    )
+    method_diagnostics = tuple(
+        _method_diagnostics(
+            method,
+            x_l=x_l,
+            y_l=y_l,
+            x_u=x_u,
+            pseudo_labels_u=pseudo_labels_u,
+            theta_zero=theta_zero,
+            gradient=gradient,
+            hessian=hessian,
+            q=q,
+            pseudo_weight=pseudo_weight,
+            ridge_lambda=ridge_lambda,
+        )
+        for method in methods
+    )
+    calibrated_labeled = calibration.predict(z_l)
+    residual_u = x_u @ theta_zero - pseudo_labels_u
+    ours = selections["ours"]
+    top_teacher = selections["top_teacher"]
+    random_selection = selections["random"]
+    return FitDiagnostics(
+        feature_scale=feature_transform.scale,
+        feature_mean_norm=float(np.linalg.norm(feature_transform.mean)),
+        label_mean=label_transform.mean,
+        label_scale=label_transform.scale,
+        calibration_slope=calibration.slope,
+        calibration_intercept=calibration.intercept,
+        calibration_labeled_rmse=float(
+            np.sqrt(np.mean((calibrated_labeled - y_l) ** 2))
+        ),
+        calibration_labeled_spearman=_correlation(y_l, calibrated_labeled),
+        teacher_scores_labeled=_teacher_score_diagnostics(z_l),
+        teacher_scores_unlabeled=_teacher_score_diagnostics(z_u),
+        teacher_scores_test=_teacher_score_diagnostics(z_test),
+        teacher_student_unlabeled_residual=_distribution_diagnostics(residual_u),
+        supervised_stationarity_identity_residual=float(
+            np.linalg.norm(gradient + ridge_lambda * theta_zero)
+        ),
+        full_score=_score_diagnostics(full_scores, ours, random_selection),
+        no_hessian_score=_score_diagnostics(
+            no_h_scores,
+            selections["no_hessian"],
+            random_selection,
+        ),
+        ours_top_teacher_overlap=len(set(ours) & set(top_teacher)) / q,
+        methods=method_diagnostics,
     )
 
 
@@ -620,6 +819,11 @@ def _validate_against_protocol(inputs: FitInputs, protocol: Protocol) -> None:
         raise ValueError("unsupported feature transform")
     if protocol.preprocessing.student_fit != "no_intercept":
         raise ValueError("unsupported student fit")
+    expected_source_digest = canonical_source_digest(protocol)
+    if inputs.source_digest != expected_source_digest:
+        raise ValueError(
+            "FitInputs source_digest does not match the pinned protocol sources"
+        )
 
 
 def fit_task(inputs: FitInputs, protocol: Protocol) -> FitResult:
@@ -755,57 +959,31 @@ def fit_task(inputs: FitInputs, protocol: Protocol) -> FitResult:
         )
         for replicate in range(protocol.random_diagnostic_replicates)
     )
-    gradient, hessian = labeled_gradient_hessian(
-        x_l,
-        y_l,
-        theta_zero,
-        protocol.ridge_lambda,
-    )
-    method_diagnostics = tuple(
-        _method_diagnostics(
-            method,
-            x_l=x_l,
-            y_l=y_l,
-            x_u=x_u,
-            pseudo_labels_u=pseudo_labels_u,
-            theta_zero=theta_zero,
-            gradient=gradient,
-            hessian=hessian,
-            q=protocol.q,
-            pseudo_weight=protocol.pseudo_weight,
-            ridge_lambda=protocol.ridge_lambda,
-        )
-        for method in methods
-    )
-    ours = selections["ours"]
-    top_teacher = selections["top_teacher"]
-    random_selection = selections["random"]
-    diagnostics = FitDiagnostics(
-        feature_scale=feature_transform.scale,
-        feature_mean_norm=float(np.linalg.norm(feature_transform.mean)),
-        label_mean=label_transform.mean,
-        label_scale=label_transform.scale,
-        calibration_slope=calibration.slope,
-        calibration_intercept=calibration.intercept,
-        calibration_labeled_rmse=float(
-            np.sqrt(np.mean((calibration.predict(inputs.z_l) - y_l) ** 2))
-        ),
-        supervised_stationarity_identity_residual=float(
-            np.linalg.norm(gradient + protocol.ridge_lambda * theta_zero)
-        ),
-        full_score=_score_diagnostics(full_scores, ours, random_selection),
-        no_hessian_score=_score_diagnostics(
-            no_h_scores,
-            selections["no_hessian"],
-            random_selection,
-        ),
-        ours_top_teacher_overlap=len(set(ours) & set(top_teacher)) / protocol.q,
-        methods=method_diagnostics,
+    diagnostics = _build_fit_diagnostics(
+        feature_transform=feature_transform,
+        label_transform=label_transform,
+        calibration=calibration,
+        z_l=inputs.z_l,
+        z_u=inputs.z_u,
+        z_test=inputs.z_test,
+        x_l=x_l,
+        y_l=y_l,
+        x_u=x_u,
+        pseudo_labels_u=pseudo_labels_u,
+        theta_zero=theta_zero,
+        full_scores=full_scores,
+        no_h_scores=no_h_scores,
+        selections=selections,
+        methods=methods,
+        q=protocol.q,
+        pseudo_weight=protocol.pseudo_weight,
+        ridge_lambda=protocol.ridge_lambda,
     )
     return FitResult(
         assay_id=inputs.assay_id,
         seed=inputs.seed,
         source_digest=inputs.source_digest,
+        protocol_digest=canonical_protocol_digest(protocol),
         labeled_hashes=inputs.labeled_hashes,
         unlabeled_hashes=inputs.unlabeled_hashes,
         test_hashes=inputs.test_hashes,
@@ -848,13 +1026,6 @@ def fit_task(inputs: FitInputs, protocol: Protocol) -> FitResult:
 
 
 @dataclass(frozen=True)
-class CorrelationDiagnostic:
-    defined: bool
-    value: float | None
-    reason: str | None
-
-
-@dataclass(frozen=True)
 class MethodEvaluation:
     name: MethodName
     spearman: float
@@ -869,7 +1040,7 @@ class OracleDiagnostics:
 
     score_alignment: CorrelationDiagnostic
     score_vs_absolute_error: CorrelationDiagnostic
-    gradient_cosine: float
+    gradient_cosine: float | None
     gradient_cosine_defined: bool
 
 
@@ -901,7 +1072,7 @@ def _metric_cosine(
     first: FloatArray,
     second: FloatArray,
     metric: FloatArray | None,
-) -> tuple[float, bool]:
+) -> tuple[float | None, bool]:
     if metric is None:
         first_mapped = first
         second_mapped = second
@@ -921,7 +1092,7 @@ def _metric_cosine(
         * np.sqrt(max(float(second @ second_mapped), 0.0))
     )
     if denominator <= np.finfo(np.float64).tiny:
-        return 0.0, False
+        return None, False
     return float(np.clip(numerator / denominator, -1.0, 1.0)), True
 
 
@@ -942,6 +1113,10 @@ def _validate_evaluation_provenance(
 def _validate_fit_integrity(fit: FitResult) -> None:
     """Fail closed when a frozen fit artifact no longer matches its own card."""
     _identity(fit.assay_id, fit.seed, fit.source_digest)
+    if not isinstance(fit.protocol_digest, str) or not _SHA256_PATTERN.fullmatch(
+        fit.protocol_digest
+    ):
+        raise ValueError("fit protocol_digest must be a lowercase SHA-256 digest")
     labeled_hashes = _hashes(fit.labeled_hashes, name="labeled_hashes")
     unlabeled_hashes = _hashes(fit.unlabeled_hashes, name="unlabeled_hashes")
     test_hashes = _hashes(fit.test_hashes, name="test_hashes")
@@ -1131,6 +1306,42 @@ def _validate_fit_integrity(fit: FitResult) -> None:
             raise ValueError(f"{method.name} test predictions are inconsistent")
         if _constant(method.test_predictions):
             raise ValueError(f"{method.name} produced a constant primary prediction")
+        if method.name == "supervised":
+            training_x = fit.x_l
+            training_y = fit.y_l_standardized
+            training_weights = np.ones(fit.x_l.shape[0], dtype=np.float64)
+        else:
+            indices = np.asarray(selected, dtype=np.int64)
+            training_x = np.concatenate([fit.x_l, fit.x_u[indices]], axis=0)
+            training_y = np.concatenate(
+                [fit.y_l_standardized, fit.pseudo_labels_u[indices]]
+            )
+            training_weights = np.concatenate(
+                [
+                    np.ones(fit.x_l.shape[0], dtype=np.float64),
+                    np.full(fit.q, fit.pseudo_weight, dtype=np.float64),
+                ]
+            )
+        denominator = float(np.sum(training_weights))
+        normalized_stationarity = (
+            training_x.T
+            @ (training_weights * (training_x @ method.coefficients - training_y))
+            / denominator
+            + fit.ridge_lambda * method.coefficients
+        )
+        right_hand_scale = float(
+            np.linalg.norm(training_x.T @ (training_weights * training_y) / denominator)
+        )
+        stationarity_tolerance = (
+            256.0
+            * np.finfo(np.float64).eps
+            * max(1.0, right_hand_scale, float(np.linalg.norm(method.coefficients)))
+            * max(1, training_x.shape[1])
+        )
+        if float(np.linalg.norm(normalized_stationarity)) > stationarity_tolerance:
+            raise ValueError(
+                f"{method.name} coefficients violate the normalized normal equations"
+            )
 
     if (
         type(fit.random_diagnostic_replicates) is not int
@@ -1140,7 +1351,7 @@ def _validate_fit_integrity(fit: FitResult) -> None:
         raise ValueError(
             "random diagnostic replicate count does not match the fit card"
         )
-    for replicate, indices in enumerate(fit.random_diagnostic_indices):
+    for replicate, diagnostic_indices in enumerate(fit.random_diagnostic_indices):
         expected = tuple(
             int(value)
             for value in random_indices(
@@ -1153,16 +1364,65 @@ def _validate_fit_integrity(fit: FitResult) -> None:
                 ),
             )
         )
-        if indices != expected:
+        if diagnostic_indices != expected:
             raise ValueError("random diagnostic indices do not match their seed stream")
 
+    expected_diagnostics = _build_fit_diagnostics(
+        feature_transform=fit.feature_transform,
+        label_transform=fit.label_transform,
+        calibration=fit.teacher_calibration,
+        z_l=fit.z_l,
+        z_u=fit.z_u,
+        z_test=fit.z_test,
+        x_l=fit.x_l,
+        y_l=fit.y_l_standardized,
+        x_u=fit.x_u,
+        pseudo_labels_u=fit.pseudo_labels_u,
+        theta_zero=theta_zero,
+        full_scores=fit.full_scores,
+        no_h_scores=fit.no_hessian_scores,
+        selections=expected_selections,
+        methods=fit.methods,
+        q=fit.q,
+        pseudo_weight=fit.pseudo_weight,
+        ridge_lambda=fit.ridge_lambda,
+    )
+    try:
+        actual_diagnostics = json.dumps(
+            dataclasses.asdict(fit.diagnostics),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        expected_diagnostics_payload = json.dumps(
+            dataclasses.asdict(expected_diagnostics),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("fit diagnostics must contain only finite values") from error
+    if actual_diagnostics != expected_diagnostics_payload:
+        raise ValueError("fit diagnostics do not match recomputed diagnostics")
 
-def evaluate_task(fit: FitResult, labels: EvaluationLabels) -> EvaluationResult:
+
+def evaluate_task(
+    fit: FitResult,
+    labels: EvaluationLabels,
+    *,
+    expected_fit_digest: str,
+) -> EvaluationResult:
     """Evaluate a frozen fit using hidden labels without refitting or mutation."""
     if not isinstance(fit, FitResult):
         raise ValueError("fit must be a FitResult")
     if not isinstance(labels, EvaluationLabels):
         raise ValueError("labels must be EvaluationLabels")
+    if not isinstance(expected_fit_digest, str) or not _SHA256_PATTERN.fullmatch(
+        expected_fit_digest
+    ):
+        raise ValueError("expected_fit_digest must be a lowercase SHA-256 digest")
+    if _canonical_fit_digest_unchecked(fit) != expected_fit_digest:
+        raise ValueError("current fit digest does not match expected_fit_digest")
     _validate_fit_integrity(fit)
     _validate_evaluation_provenance(fit, labels)
     y_u = fit.label_transform.transform(labels.y_u)

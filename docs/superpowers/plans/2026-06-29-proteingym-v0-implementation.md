@@ -239,7 +239,7 @@ Expected: import failure for `self_improve_protein.experiment`.
 
 - [ ] **Step 3: Implement fit then evaluate as separate pure functions**
 
-`fit_task(FitInputs, Protocol)` returns selected hashes, coefficients, test predictions, and non-label diagnostics. `evaluate_task(FitArtifact, EvaluationLabels)` adds metrics and hidden pseudo-error diagnostics without changing the fit artifact. Reject any method artifact whose selected count, pseudo weight, calibration, or source hashes differ from protocol.
+`fit_task(FitInputs, Protocol)` returns selected hashes, coefficients, test predictions, protocol/source digests, and non-label diagnostics. Freeze its canonical digest immediately. `evaluate_task(FitArtifact, EvaluationLabels, expected_fit_digest=...)` must verify that external digest before accessing hidden labels, then add metrics and hidden pseudo-error diagnostics without changing the fit artifact. Reject any method artifact whose selected count, pseudo weight, calibration, source hashes, exact weighted normal equations, or diagnostics differ from protocol. The analysis-only **test-risk oracle influence** uses the hidden test outer gradient with the frozen teacher pseudo-gradient; it does not replace the pseudo-label with the hidden unlabeled label.
 
 - [ ] **Step 4: Verify GREEN and leakage invariance**
 
