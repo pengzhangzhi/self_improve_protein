@@ -1,6 +1,6 @@
 # Experiment Card: External-Teacher Score-Ranking v0
 
-**Question:** With identical calibrated `Ensemble_ESM1v` pseudo-labels, does the paper-inspired full-Hessian score choose 192 variants that improve low-label ProteinGym test Spearman more than random choice?
+**Question:** With identical calibrated `ESM1v_ensemble` pseudo-labels, does the paper-inspired full-Hessian score choose 192 variants that improve low-label ProteinGym test Spearman more than random choice?
 
 **Hypothesis:** Full-score selection increases assay-macro paired test Spearman over random selection because its candidates have the largest predicted first-order decrease in labeled squared loss.
 
@@ -14,7 +14,7 @@
 
 **Guardrails:** No non-finite tasks; selections and fitted parameters are invariant to hidden-label perturbation; all pseudo methods use identical labels/count/weight; report MSE and NDCG@10% without using them to overturn the primary decision.
 
-**Data / split:** ProteinGym v1.3 substitutions, literal teacher column `Ensemble_ESM1v`, first eight lexicographically sorted assays with at least 6,000 usable variants and length at most 512. Per seed: 96 labeled, 2,000 unlabeled, 1,000 test from a fixed hash-sorted 6,000-row working set. The ninth eligible assay is development-only.
+**Data / split:** ProteinGym v1.3 substitutions from Zenodo record `15293562`, literal teacher column `ESM1v_ensemble`, first eight lexicographically sorted assays with at least 6,000 usable variants and length at most 512. Per seed: 96 labeled, 2,000 unlabeled, 1,000 test from a fixed hash-sorted 6,000-row working set. The ninth eligible assay is development-only.
 
 **Leakage check:** Selector and fit functions cannot accept hidden unlabeled/test labels. Freeze data checksums, assay IDs, working-set hashes, and split hashes before model evaluation; verify selection invariance after permuting hidden labels.
 

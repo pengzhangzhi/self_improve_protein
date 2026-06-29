@@ -2,6 +2,8 @@
 
 **Status:** Approved by the user's autonomous execution mandate on 2026-06-29.
 
+**Pre-outcome amendment (2026-06-29):** Inspection of the v1.3 merged files corrected the literal teacher column from the upstream input-score name `Ensemble_ESM1v` to the distributed merged-column name `ESM1v_ensemble`. The source was pinned to Zenodo record `15293562` because ProteinGymPy 0.9.3 still points its zero-shot loader at v1.2. No method outcome had been computed.
+
 ## Research goal contract
 
 The research outcome is a defensible yes/no answer to whether the proposed first-order score chooses externally pseudo-labeled protein variants that improve low-label DMS fitness ranking relative to random selection. The evidence bar is a predeclared 8-assay by 5-seed study with a locked primary metric, followed by an untouched-assay replication if the result is positive or ambiguous. A green software test suite is necessary but is not evidence for the method.
@@ -40,13 +42,15 @@ A positive result supports this empirical selection rule. It does not validate t
 
 ### Data release, teacher, and assay selection
 
-- Pin the official ProteinGym substitution benchmark to release `v1.3`.
-- Use the literal zero-shot score column `Ensemble_ESM1v` for every assay, with no per-assay fallback and no outcome-based teacher choice.
+- Pin the official ProteinGym substitution benchmark to release `v1.3` at Zenodo record `15293562`.
+- Use the literal zero-shot score column `ESM1v_ensemble` for every assay, with no per-assay fallback and no outcome-based teacher choice.
 - Join DMS rows and teacher scores one-to-one on `mutant`.
-- A usable row has a finite `DMS_score`, a finite `Ensemble_ESM1v` score, a non-empty `mutated_sequence`, a sequence length no greater than 512, and a unique mutated sequence within its assay.
+- A usable row has a finite `DMS_score`, a finite `ESM1v_ensemble` score, a non-empty `mutated_sequence`, a sequence length no greater than 512, and a unique mutated sequence within its assay.
 - An eligible assay has at least 6,000 usable rows and target length no greater than 512.
 - Sort eligible assays lexicographically by `DMS_id`; the first eight form the confirmatory set. The ninth eligible assay is development-only and is excluded from confirmatory and replication summaries.
 - Record release URLs, SHA-256 checksums, upstream metadata commit, selected assay IDs, row counts, and sequence hashes in an immutable manifest before embeddings are computed.
+
+The pre-outcome eligibility result fixes the confirmatory IDs as `ADRB2_HUMAN_Jones_2020`, `AMIE_PSEAE_Wrenbeck_2017`, `CCR5_HUMAN_Gill_2023`, `CP2C9_HUMAN_Amorosi_2021_abundance`, `CP2C9_HUMAN_Amorosi_2021_activity`, `D7PM05_CLYGR_Somermeyer_2022`, `F7YBW8_MESOW_Aakre_2015`, and `F7YBW8_MESOW_Ding_2023`. `GFP_AEQVI_Sarkisyan_2016` is development-only.
 
 Within each assay, sort usable rows by SHA-256 of the UTF-8 tuple `(DMS_id, mutant, mutated_sequence)` and take the first 6,000 as the fixed working set. This avoids dependence on source-file row order without using labels to choose examples.
 

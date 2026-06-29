@@ -48,7 +48,7 @@ def test_v0_protocol_is_locked():
     p = load_protocol(Path("configs/v0.yaml"))
     assert (p.n_labeled, p.n_unlabeled, p.n_test, p.q) == (96, 2000, 1000, 192)
     assert (p.pseudo_weight, p.ridge_lambda, p.damping) == (0.1, 0.01, 0.0001)
-    assert p.teacher_column == "Ensemble_ESM1v"
+    assert p.teacher_column == "ESM1v_ensemble"
     assert p.seeds == (0, 1, 2, 3, 4)
 
 def test_seed_derivation_is_purpose_separated():
@@ -361,7 +361,7 @@ Expected: zero failed tests and zero static errors. Then run `git add tests/test
 
 - [ ] **Step 1: Download official v1.3 archives and freeze checksums**
 
-Run `prepare-data` against the official substitution and zero-shot archive URLs. Expected: one immutable manifest with one-to-one `Ensemble_ESM1v` coverage, eligible assay list, the eight confirmatory IDs, ninth development ID, 6,000 row hashes per chosen assay, and source SHA-256 values.
+Run `prepare-data` against the pinned official v1.3 substitution, zero-shot, and metadata URLs from Zenodo record `15293562`. Expected: one immutable manifest with one-to-one `ESM1v_ensemble` coverage, eligible assay list, the eight confirmatory IDs, ninth development ID, 6,000 row hashes per chosen assay, and source SHA-256 values.
 
 - [ ] **Step 2: Inspect the manifest without evaluating outcomes**
 
