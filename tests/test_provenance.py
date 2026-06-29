@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from self_improve_protein import provenance
 from self_improve_protein.provenance import (
     atomic_write_json,
     derive_seed,
@@ -68,6 +69,72 @@ def test_atomic_json_write_replaces_existing_file_without_temp_file(
     atomic_write_json(destination, {"new": True})
 
     assert json.loads(destination.read_text(encoding="utf-8")) == {"new": True}
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_atomic_json_write_fsyncs_destination_local_temp_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "nested" / "report.json"
+    events: list[str] = []
+    replace_sources: list[Path] = []
+    real_fsync = provenance.os.fsync
+    real_replace = provenance.os.replace
+
+    def recording_fsync(file_descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(file_descriptor)
+
+    def recording_replace(source: Path, target: Path) -> None:
+        events.append("replace")
+        replace_sources.append(Path(source))
+        real_replace(source, target)
+
+    monkeypatch.setattr(provenance.os, "fsync", recording_fsync)
+    monkeypatch.setattr(provenance.os, "replace", recording_replace)
+
+    atomic_write_json(destination, {"ready": True})
+
+    assert events == ["fsync", "replace"]
+    assert len(replace_sources) == 1
+    assert replace_sources[0].parent == destination.parent
+
+
+def test_atomic_json_write_cleans_destination_local_temp_after_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "report.json"
+    original = '{"preserved": true}\n'
+    destination.write_text(original, encoding="utf-8")
+    fsync_called = False
+    captured_source: Path | None = None
+    real_fsync = provenance.os.fsync
+
+    def recording_fsync(file_descriptor: int) -> None:
+        nonlocal fsync_called
+        fsync_called = True
+        real_fsync(file_descriptor)
+
+    def failing_replace(source: Path, target: Path) -> None:
+        nonlocal captured_source
+        captured_source = Path(source)
+        assert Path(target) == destination
+        assert json.loads(captured_source.read_text(encoding="utf-8")) == {
+            "replacement": True
+        }
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(provenance.os, "fsync", recording_fsync)
+    monkeypatch.setattr(provenance.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        atomic_write_json(destination, {"replacement": True})
+
+    assert fsync_called
+    assert destination.read_text(encoding="utf-8") == original
+    assert captured_source is not None
+    assert captured_source.parent == destination.parent
+    assert not captured_source.exists()
     assert list(tmp_path.iterdir()) == [destination]
 
 
