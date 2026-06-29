@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "self-improve-protein"
+version = "0.1.0"
+description = "External-teacher pseudo-label selection experiments on ProteinGym"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Fred Peng" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "pyarrow",
+    "pydantic>=2",
+    "PyYAML",
+    "typer",
+    "rich",
+    "requests",
+    "remotezip",
+]
+
+[project.optional-dependencies]
+embed = [
+    "torch",
+    "transformers<5",
+]
+dev = [
+    "pytest",
+    "hypothesis",
+    "ruff",
+    "mypy",
+    "build",
+    "types-PyYAML",
+]
+
+[project.scripts]
+self-improve-protein = "self_improve_protein.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true

@@ -1,0 +1,47 @@
+# Python environments and generated package output
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Private inputs and generated research artifacts
+data/
+artifacts/
+local/
+models/
+embeddings/
+runs/
+wandb/
+
+# Model, embedding, tabular, and scheduler output files
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+*.arrow
+*.parquet
+*.log
+slurm-*.out
+slurm-*.err
+
+# Credentials and local environment files
+.env
+.env.*
+credentials/
+*.pem
+*.key
+
+# Compact, reviewed tables under results/ remain trackable.
