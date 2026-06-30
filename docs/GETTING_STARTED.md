@@ -1,19 +1,18 @@
 # Getting started
 
-Welcome. You supplied the mathematical theory; this repository is the empirical
-test bed built to ask how its selection idea behaves in a controlled protein
-fitness problem. The implementation completed the frozen study and passed its
-software and provenance checks. The scientific answer was negative for the
-selector: it did **not** beat random selection of model-generated training
-targets in this setup.
+Welcome. You supplied the mathematical theory; this repository is its empirical
+test bed for a protein prediction problem. The completed, predeclared study
+passed its software and result-traceability checks. Its scientific answer was
+negative: the tested rule for choosing model-generated training examples did
+**not** beat choosing the same number at random in this setup.
 
 Choose the route that matches what you need today:
 
 | Route | Read |
 | --- | --- |
-| **10-minute science** | “The biological problem,” “The low-label experiment,” “What v0 tests,” and “The experimental story” |
-| **30-minute code tour** | The science sections, then “Repository map”; open `config.py`, `ridge.py`, `selection.py`, and `experiment.py` in that order |
-| **Hands-on setup** | “Local setup,” then “Extending the study safely” and “Troubleshooting” |
+| **10-minute science** | [Biology](#the-biological-problem-from-first-principles) → [low-label experiment](#the-low-label-experiment) → [claim boundary](#what-v0-tests) → [results timeline](#results-timeline). Skip [notation-to-code](#manuscript-notation-to-code) on the first pass. |
+| **30-minute code tour** | Follow the science route, include [notation-to-code](#manuscript-notation-to-code), then use the [first code tour](#first-code-tour). |
+| **Hands-on setup** | Start with [local setup](#local-setup) and [troubleshooting](#troubleshooting). Use [Slurm reproduction](#full-reproduction-with-slurm) only with a maintainer. |
 
 ## The biological problem, from first principles
 
@@ -56,30 +55,30 @@ deterministic 6,000-variant working set:
 
 The remaining working-set rows form an unused buffer. There are eight assays
 and five fixed seeds, giving 40 confirmatory tasks. The 192 pseudo-labels carry
-total weight `wq = 19.2` beside 96 real labels, so their final objective fraction
-is `19.2 / 115.2 = 1/6`.
+aggregate weight `wq = 192 * 0.1 = 19.2` beside 96 real labels. The total
+training weight is therefore `96 + 19.2 = 115.2`, and pseudo-labels contribute
+`19.2 / 115.2 = 1/6` of it.
 
 The model pipeline has four stages:
 
-1. **Representation and preprocessing.** ESM-2, a pretrained protein language
-   model, converts each sequence into a 480-number **embedding** by averaging
-   its residue representations. “Frozen” means the ESM-2 parameters are not
-   trained here. The raw cached embeddings enter as `FitInputs.x_l`,
-   `FitInputs.x_u`, and `FitInputs.x_test`. Means and one scalar
-   root-mean-square (RMS) scale are fitted on the 96 labeled embeddings only,
-   then applied to all three splits. Ridge fitting, gradients, Hessians, and
-   predictions use these transformed matrices.
+1. **Representation.** ESM-2, a pretrained protein language model, converts
+   each sequence into a 480-number **embedding** by averaging its residue
+   representations. Its model parameters are not trained in this study.
 2. **External teacher.** ProteinGym's `ESM1v_ensemble` predicts mutation effects
    from sequence without fitting to this assay, often called a *zero-shot*
    score. A slope and intercept fitted on the 96 labels align those scores to
    the assay's standardized scale. The calibrated predictions become candidate
    pseudo-labels.
-3. **Student.** A no-intercept linear ridge regressor predicts standardized DMS
-   score from the ESM-2 embedding. Ridge adds a quadratic penalty to stabilize
-   a 480-feature fit from only 96 labels.
+3. **Student.** A linear ridge regressor predicts standardized DMS score from
+   the ESM-2 embedding. Ridge adds a quadratic penalty to stabilize a
+   480-feature fit from only 96 labels.
 4. **Selection and refit.** A method chooses 192 of the 2,000 candidates. The
    student is refit on the 96 real labels plus those weighted pseudo-labels,
-   then evaluated on the untouched test split.
+   then evaluated on the test split.
+
+Two similar words have different jobs here. The **locked protocol** is the
+study plan written down before results and then held fixed. The **frozen ESM-2
+model** is a pretrained network whose parameters are not updated here.
 
 The four v0 comparison methods differ only in whether and how candidates are
 chosen:
@@ -91,7 +90,8 @@ chosen:
 | Top teacher | Select the 192 largest calibrated teacher predictions |
 | Full influence | Select the 192 largest paper-inspired influence scores |
 
-A separately carded exploratory [**no-Hessian**
+An **ablation** is a controlled removal of one method component. The separately
+carded exploratory [no-Hessian
 ablation](research/experiment-card-no-hessian.md) replaces inverse-Hessian
 geometry with the identity. All pseudo-label methods otherwise share the same
 teacher labels, count, weight, preprocessing, student, and test set.
@@ -117,7 +117,7 @@ theory's squared-risk objective; lower is better. **Normalized discounted
 cumulative gain at 10% (NDCG@10%)** measures how well the model ranks the
 highest-fitness tenth of the test variants; higher is better.
 
-## What v0 tests—and what it does not
+## What v0 tests
 
 The manuscript's literal squared-loss self-teacher cannot provide a first-round
 ranking at the supervised optimum:
@@ -151,14 +151,18 @@ the finite rather than asymptotic perturbation. The completed result is specific
 to this teacher, representation, ridge student, label budget, and assay slice;
 it is not an impossibility theorem for pseudo-label selection.
 
-## The experimental story
+## Results timeline
 
-Each later study was a predeclared diagnosis on already exposed assays. None
-replaces the locked v0 comparison. “Exact-CV” below means exact
-cross-validation: repeatedly fitting on part of the labeled data and scoring
-candidates on the fold-held-out labeled part. Those fold labels are validation
-data: they are deliberately reused across adaptive selection steps, not confused
-with the sealed 1,000-variant test outcomes used only after fitting is frozen.
+V0 ran first under the locked plan. After its result was reviewed, the crossfit,
+locality, and exact-CV studies were written down and run on assay outcomes that
+had already been viewed in v0 or development. These later studies diagnose why
+the method behaved as it did; they do not replace the v0 result.
+
+Exact-CV reuses the same 96 labels in four folds. At each selection step, a fold
+fits on 72 labels and uses the other 24 as validation data. Those validation
+labels are consulted repeatedly while choosing 192 candidates. The separate
+1,000-variant test labels remain unavailable until the candidate order, final
+student fit, and predictions are fixed.
 
 | Study | Question | Answer |
 | --- | --- | --- |
@@ -167,124 +171,152 @@ with the sealed 1,000-variant test outcomes used only after fitting is frozen.
 | **Locality** | Is the 192-point, weight-0.1 update too large for a first-order score? | Smaller updates made the parameter approximation more faithful, but full-Hessian and cross-fitted influence each failed to beat random in all 15 cells. |
 | **Exact-CV** | Does exact greedy held-out-loss lookahead work after removing the Hessian and Taylor approximations? | It fit the reused validation folds strongly but generalized worse than random. |
 
-The no-Hessian ablation had one descriptive positive Spearman cell in the
-locality grid (`q=72`, `w=0.1`; `p=0.6172`), but its MSE was worse than random
-in all 15 cells. No selector established superiority to random.
+At one locality-grid setting (`q=72`, `w=0.1`), no-Hessian was `+0.00654`
+Spearman above random. This descriptive result was not significant (assay
+sign-flip `p=0.6172`), and its MSE was worse than random in all 15 settings. No
+selection method established superiority to random.
 
 The reviewed v0 mean Spearman values were:
 
-| Supervised | Random pseudo-labeling | Full influence |
-| ---: | ---: | ---: |
-| `0.29309` | `0.34971` | `0.29445` |
+| Supervised | Random pseudo-labeling | Top teacher | Full influence |
+| ---: | ---: | ---: | ---: |
+| `0.29309` | `0.34971` | `0.34230` | `0.29445` |
 
-Full influence minus random was `-0.05526` Spearman and won **0/8 assay
-means**. Random's improvement over supervised is consistent with useful signal
-in the calibrated external teacher, but it is partly confounded by the changed
-loss-to-penalty balance (effective regularization) in pseudo-labeled retraining.
-The full-influence-versus-random contrast holds pseudo-labels, count, weight, and
-retraining objective fixed, so it is the clean selection test—and the full
-selector lost it.
+Full influence minus random was `-0.05526` Spearman; full influence had lower
+mean Spearman in all eight assays. Random's improvement over supervised is
+consistent with useful signal in the calibrated external teacher, but that
+contrast also changes the loss-to-penalty balance (effective regularization).
+Full influence versus random holds pseudo-labels, count, weight, and retraining
+objective fixed, so it is the clean selection test—and full influence lost it.
 
-Exact-CV reinforced the distinction between finding an attractive selection
-surrogate and improving hidden outcomes. Its test MSE was `1.6177`, versus
-random's `1.1857`; its Spearman was `0.30336`, versus random's `0.34971`.
-Meanwhile, its reused fold-validation MSE fell sharply. The combined evidence
-is consistent with adaptive validation overfitting and/or mismatch between the
-selection surrogate and test performance. It does not identify either mechanism
-as the unique cause.
+A **selection surrogate** is the quantity used to choose candidates, which may
+differ from the final goal. Exact-CV's surrogate was reused fold-validation
+MSE. It fell sharply, yet test MSE was `1.6177` versus random's `1.1857`, and
+Spearman was `0.30336` versus `0.34971`. This is consistent with adaptive
+validation overfitting and/or a mismatch between the selection surrogate and
+test performance; the study does not identify one unique cause.
 
 All exploratory promotion gates failed, so the 26 designated untouched assay
 outcomes remain sealed. The authoritative interpretation, including evidence
 hashes, is in the [overall conclusion](results/overall-conclusion.md).
 
-## Repository map
+## First code tour
 
-Read by scientific responsibility rather than alphabetical filename:
+Follow four symbol-level steps rather than reading whole modules:
 
-| Responsibility | Where | Read it when… | Main dependencies |
-| --- | --- | --- | --- |
-| Frozen protocol | [`configs/v0.yaml`](../configs/v0.yaml), [`config.py`](../src/self_improve_protein/config.py) | You need the exact data, model, split, and hyperparameter values | YAML, Pydantic |
-| Data cohort and splits | [`data.py`](../src/self_improve_protein/data.py) | You need to understand joins, eligibility, row hashes, manifests, or disjoint splits | Protocol, ProteinGym archives |
-| Sequence representation | [`embeddings.py`](../src/self_improve_protein/embeddings.py) | You need ESM-2 residue pooling, GPU inference, or validated caches | Torch, Transformers, source hashes |
-| Teacher and student math | [`ridge.py`](../src/self_improve_protein/ridge.py) | You need feature/label transforms, `ESM1v_ensemble` calibration, ridge fitting, gradients, or Hessians | NumPy |
-| Candidate rules | [`selection.py`](../src/self_improve_protein/selection.py) | You need random, top-teacher, full, no-Hessian, or crossfit scoring and tie-breaking | Ridge utilities, deterministic seeds |
-| End-to-end task | [`experiment.py`](../src/self_improve_protein/experiment.py) | You need to trace one fit, the hidden-label boundary, refitting, diagnostics, and evaluation | Config, ridge, selection, metrics, provenance |
-| Metric definitions | [`metrics.py`](../src/self_improve_protein/metrics.py) | You need exact Spearman, MSE, or NDCG@10% behavior | NumPy, SciPy |
-| Confirmatory summaries | [`analysis.py`](../src/self_improve_protein/analysis.py) | You need assay-level aggregation, paired contrasts, uncertainty, or v0 decision rules | Pandas, SciPy, metrics tables |
-| Exploratory diagnoses | [`crossfit.py`](../src/self_improve_protein/crossfit.py), [`locality.py`](../src/self_improve_protein/locality.py), [`exact_cv.py`](../src/self_improve_protein/exact_cv.py) | You need the later mechanism screens after understanding v0 | Frozen v0 objects plus branch-specific cards |
-| Executable checks | [`tests/`](../tests/), [`verify_r1_r3.sh`](../scripts/verify_r1_r3.sh) | You change code or want evidence for algebra, leakage safety, determinism, and CLI contracts | Small fixtures; no full study rerun |
-| Cluster orchestration | [`slurm/`](../slurm/), especially [`submit_pipeline.sh`](../slurm/submit_pipeline.sh) | You have approved data/GPU storage and are reproducing a card | Slurm, site variables, synced environment, raw artifacts |
-| Experiment cards | [`v0`](research/experiment-card-v0.md), [`no-Hessian`](research/experiment-card-no-hessian.md), [`crossfit`](research/experiment-card-crossfit.md), [`locality`](research/experiment-card-locality.md), [`exact-CV`](research/experiment-card-exact-cv.md) | Before reading or changing an experiment implementation | Scientific question and frozen protocol |
-| Decision memos | [`overall-conclusion.md`](results/overall-conclusion.md) and [`docs/results/`](results/) | You need reviewed outcomes rather than implementation detail | Aggregated, provenance-checked artifacts |
+| Step | Exact symbols | What to follow |
+| --- | --- | --- |
+| 1. Load the plan | [`Protocol`, `load_protocol`](../src/self_improve_protein/config.py) | Validate the locked YAML values from [`configs/v0.yaml`](../configs/v0.yaml). |
+| 2. Build the student | [`fit_feature_transform`, `fit_label_transform`, `fit_teacher_calibration`, `fit_weighted_ridge`](../src/self_improve_protein/ridge.py) | Center embeddings with labeled-only means and one scalar RMS scale, calibrate the teacher, and fit ridge. |
+| 3. Rank candidates | [`influence_scores`, `stable_top_k`](../src/self_improve_protein/selection.py) | Compute the full score, order candidates, and break exact ties reproducibly. |
+| 4. Run one task | [`FitInputs`, `fit_task`, `evaluate_task`](../src/self_improve_protein/experiment.py) | Keep hidden outcomes outside fitting, refit every method, then admit evaluation labels and compute results. |
+
+### Broader reference map
+
+| Responsibility | Where to look |
+| --- | --- |
+| ProteinGym joins, eligibility, manifests, and splits | [`data.py`](../src/self_improve_protein/data.py) |
+| ESM-2 pooling and validated embedding caches | [`embeddings.py`](../src/self_improve_protein/embeddings.py) |
+| Metric definitions and assay-level summaries | [`metrics.py`](../src/self_improve_protein/metrics.py), [`analysis.py`](../src/self_improve_protein/analysis.py) |
+| Later diagnostic implementations | [`crossfit.py`](../src/self_improve_protein/crossfit.py), [`locality.py`](../src/self_improve_protein/locality.py), [`exact_cv.py`](../src/self_improve_protein/exact_cv.py) |
+| Executable checks | [`tests/`](../tests/), [`verify_r1_r3.sh`](../scripts/verify_r1_r3.sh) |
+| Experiment plans and reviewed decisions | [`docs/research/`](research/), [`docs/results/`](results/) |
 
 ## Local setup
 
-Python 3.11 or newer and [uv](https://docs.astral.sh/uv/) are required. From a
-machine with network access:
+Python 3.11 or newer and [uv](https://docs.astral.sh/uv/) are required.
+
+### Fast orientation
+
+This path does not install Torch or require a GPU:
 
 ```bash
 git clone https://github.com/pengzhangzhi/self_improve_protein.git
 cd self_improve_protein
-uv sync --frozen --extra dev --extra embed
+uv sync --frozen
 uv run self-improve-protein --show-config
 uv run self-improve-protein --help
+```
+
+`uv sync --frozen` creates or updates the project-local `.venv` from the exact
+`uv.lock` environment. `uv run` executes the following command inside that
+environment, so you do not need to activate it manually. The config command
+prints one validated JSON record; help lists the pipeline stages. Both are
+CPU-only and take seconds after installation.
+
+### Developer checks and embedding support
+
+Install the developer tools plus the optional Torch/Transformers embedding
+stack, then run the tests:
+
+```bash
+uv sync --frozen --extra dev --extra embed
 uv run pytest -q
 ```
 
-What to expect:
-
-| Command | Cost | Successful outcome |
-| --- | --- | --- |
-| `git clone` | Small source download | A new `self_improve_protein/` checkout |
-| `uv sync ...` | One-time network/disk cost; the Torch embedding extra is large | A lockfile-faithful `.venv`; no ProteinGym data or model weights yet |
-| `--show-config` | Seconds, CPU-only | One JSON record containing the validated protocol and its digest |
-| `--help` | Seconds, CPU-only | The preparation, embedding, task, aggregation, and verification commands |
-| `pytest -q` | CPU-only unit/property tests, normally minutes or less | A passing test summary |
-
-The tests exercise code, fixtures, algebra, provenance checks, and synthetic
-probes. They do not download ProteinGym, run ESM-2 over the study sequences,
-submit Slurm jobs, or recompute the scientific result.
-
-A full reproduction additionally needs the pinned ProteinGym archives, ESM
-model weights, GPU embedding inference, artifact storage, and a Slurm cluster.
-The launcher requires site-specific variables such as `SI_ACCOUNT`,
-`SI_CPU_PARTITION`, `SI_GPU_PARTITION`, `SI_REPO_ROOT`, `SI_DATA_ROOT`,
-`SI_ARTIFACT_ROOT`, and `SI_SLURM_CONF`. Set them in a private local profile;
-never publish cluster paths, credentials, or raw-data locations in the
-repository. `submit_pipeline.sh` defaults to `SI_MODE=development`, which
-schedules two assay-seed tasks rather than the full task grid. Reproducing the
-full eight-assay by five-seed, 40-task study requires `SI_MODE=confirmatory` and
-a validated `SI_R5_GATE`; the launcher verifies that gate before it submits
-confirmatory tasks.
-
-## Extending the study safely
-
-Use this sequence for a new selector or research question:
-
-1. Write a new experiment card before inspecting new outcomes. State the
-   question, changed coordinate, comparator, metric, success gate, data slice,
-   and stop rule.
-2. Preserve baseline parity. Reuse the same split, teacher predictions, `q`,
-   `w`, student objective, random baseline, and metrics unless the card names a
-   change. A method comparison should differ only where declared.
-3. Add focused tests, then run a development-only smoke task and pilot. Passing
-   them establishes execution and data-flow integrity, not method quality.
-4. Freeze the implementation, config, selections, predictions, and provenance
-   receipts before hidden outcomes enter evaluation.
-5. Apply the predeclared promotion gate. Use untouched outcomes only for an
-   authorized confirmation; do not tune on them or unseal them after a failed
-   development gate.
-6. Record a separate decision memo. Exploratory repairs remain diagnoses and
-   do not replace the completed v0 result.
+The embedding extra has a larger network and disk cost. The tests use small
+fixtures, algebra checks, traceability checks, and synthetic probes. They do not
+download ProteinGym, embed the study sequences, submit cluster jobs, or
+recompute the scientific result.
 
 ## Troubleshooting
 
 | Symptom | Response |
 | --- | --- |
-| `uv: command not found` | Install uv using its [official instructions](https://docs.astral.sh/uv/getting-started/installation/), open a new shell, and rerun the frozen sync. |
-| CUDA is unavailable | Config inspection and tests can still run on CPU. Check `uv run python -c "import torch; print(torch.cuda.is_available())"`; run `embed-assay` only in an approved GPU environment. |
-| ProteinGym archives or embeddings are absent | This is expected in a fresh clone: large/raw artifacts are excluded from Git. Use the pinned URLs and SHA-256 values in `configs/v0.yaml`, then follow the staged launcher. |
-| A provenance, digest, or manifest check fails | Stop. Confirm the config, source files, Git revision, ordered row hashes, runtime, and artifact root. Do not bypass a confirmatory check or edit a receipt to make it pass. |
+| `uv: command not found` | Install uv using its [official instructions](https://docs.astral.sh/uv/getting-started/installation/), open a new shell, and rerun the base sync. |
+| CUDA is unavailable | Orientation and tests can run on CPU. After installing the embedding extra, check `uv run python -c "import torch; print(torch.cuda.is_available())"`; run `embed-assay` only in an approved GPU environment. |
+| ProteinGym archives or embeddings are absent | This is expected in a fresh clone: large artifacts are excluded from Git. Use the pinned URLs and SHA-256 values in [`configs/v0.yaml`](../configs/v0.yaml), then ask the maintainer for the approved data layout. |
+| A digest, manifest, or traceability check fails | Stop. Confirm the config, source files, Git revision, ordered row hashes, runtime, and artifact root. Do not bypass a confirmatory check or edit a receipt to make it pass. |
+
+## Full reproduction with Slurm
+
+**Maintainer-assisted.** Slurm is the scheduler that queues CPU and GPU work on
+a shared cluster. Submitting through it changes cluster state and consumes
+shared resources. Before any submission, obtain an approved private site
+profile, data/model access, storage locations, and account/partition approval
+from the maintainer.
+
+The [pipeline launcher](../slurm/submit_pipeline.sh) expects site-specific
+`SI_ACCOUNT`, `SI_CPU_PARTITION`, `SI_GPU_PARTITION`, `SI_REPO_ROOT`,
+`SI_DATA_ROOT`, `SI_ARTIFACT_ROOT`, and `SI_SLURM_CONF` values. Keep their
+values private. It defaults to `SI_MODE=development`, which schedules two
+assay-seed tasks. The full eight-assay by five-seed study requires
+`SI_MODE=confirmatory` and `SI_R5_GATE` set to the filesystem path of a
+completed, validated R5 verification-gate JSON. R5 records that the
+development-only pilot and its evidence passed; see the [verification
+ladder](research/feedback-ladder.md).
+
+After the approved profile exports those values:
+
+```bash
+# SUBMITS JOBS and changes cluster state
+bash slurm/submit_pipeline.sh
+```
+
+Expected output is the path to `local/slurm/<run-id>/job_ids.json`, which
+records the submitted prepare, embedding, task-array, and aggregate job IDs.
+This is not a local orientation command.
+
+## Extending the study safely
+
+Use this sequence for a new selector or research question:
+
+1. Start from the [v0 experiment card](research/experiment-card-v0.md) and write
+   a new card before inspecting new outcomes. State the question, the one factor
+   this study changes, comparator, metric, success gate, data slice, and stop
+   rule.
+2. Preserve baseline parity. Reuse the same split, teacher predictions, `q`,
+   `w`, student objective, random baseline, and metrics unless the card names a
+   change. A method comparison should differ only where declared.
+3. Add focused tests, then run a development-only smoke task and pilot. Passing
+   them establishes execution and data-flow integrity, not method quality.
+4. Record and lock the implementation, config, selections, predictions, and
+   traceability receipts before hidden outcomes enter evaluation.
+5. Apply the predeclared promotion gate. Use untouched outcomes only for an
+   authorized confirmation; do not tune on them or unseal them after a failed
+   development gate.
+6. Record a separate decision memo. Exploratory repairs remain diagnoses and
+   do not replace the completed v0 result.
 
 ## Glossary
 
@@ -304,7 +336,7 @@ Use this sequence for a new selector or research question:
 
 ## Sources of truth, in reading order
 
-1. [Frozen v0 configuration](../configs/v0.yaml)
+1. [Locked v0 configuration](../configs/v0.yaml)
 2. [Theory-to-experiment audit](research/theory-audit.md)
 3. [Overall scientific conclusion](results/overall-conclusion.md)
 4. Experiment cards: [v0](research/experiment-card-v0.md), [no-Hessian](research/experiment-card-no-hessian.md), [crossfit](research/experiment-card-crossfit.md), [locality](research/experiment-card-locality.md), and [exact-CV](research/experiment-card-exact-cv.md)
