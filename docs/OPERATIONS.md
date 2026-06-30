@@ -145,11 +145,21 @@ Use a dedicated worktree. Immediately before either submission block, run this
 preflight in the same shell that you will keep through postflight:
 
 ```bash
-RUN_HEAD="$(git rev-parse HEAD)"
-if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
-  printf 'submission requires a clean dedicated worktree\n' >&2
+RUN_HEAD=''
+RUN_STATUS=''
+if ! RUN_HEAD="$(git rev-parse --verify 'HEAD^{commit}')" ||
+   [[ ! "$RUN_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'cannot resolve a full 40-hex HEAD commit\n' >&2
+  false
+elif ! RUN_STATUS="$(git status --porcelain=v1 --untracked-files=all)"; then
+  printf 'cannot inspect worktree status\n' >&2
+  false
+elif [[ -n "$RUN_STATUS" ]]; then
+  printf 'submission requires a clean dedicated worktree:\n%s\n' \
+    "$RUN_STATUS" >&2
   false
 else
+  unset RUN_STATUS
   printf 'immutable run HEAD: %s\n' "$RUN_HEAD"
 fi
 ```
@@ -196,6 +206,34 @@ bash slurm/submit_pipeline.sh
 This is not authorization to access or reveal the 26 designated untouched assay
 outcomes. They remain sealed, and this guide intentionally provides no substitute
 or fabricated gate value.
+
+### Reconnect to an in-flight run
+
+Before leaving the original shell, print and save this non-secret context in
+approved operator notes, not in the repository:
+
+```bash
+printf 'cd -- %q\nexport SI_RUN_ID=%q\nexport SI_MODE=%q\nRUN_HEAD=%q\n' \
+  "$(pwd -P)" "$SI_RUN_ID" "$SI_MODE" "$RUN_HEAD"
+```
+
+In a new login shell:
+
+1. Run the recorded `cd` line to return to the exact dedicated worktree.
+2. Rerun the seven site-configuration exports and the derived-path export block
+   above. This restores `SI_REPO_ROOT`, `SLURM_CONF`, and every artifact root.
+3. Run the recorded `SI_RUN_ID`, `SI_MODE`, and `RUN_HEAD` assignments exactly;
+   do not generate a new run ID.
+4. If `SI_MODE=confirmatory`, re-enter the same authorized `SI_R5_GATE` value and
+   export it. The gate is intentionally absent from the recorded context.
+
+Validate the restored non-secret context before monitoring or postflight:
+
+```bash
+test -n "$SI_RUN_ID" &&
+[[ "$SI_MODE" == development || "$SI_MODE" == confirmatory ]] &&
+[[ "$RUN_HEAD" =~ ^[0-9a-f]{40}$ ]]
+```
 
 ## Monitor, cancel, and verify
 
@@ -276,6 +314,9 @@ recovery above for a partial submission.
 scancel PREPARE_ID EMBED_ID TASK_ID AGGREGATE_ID
 ```
 
+After either cancellation path, rerun `squeue` with only the recorded non-null
+IDs, or query them with `sacct`, until no job or array element remains active.
+
 Scheduler success means every job and every array element is `COMPLETED` with
 `ExitCode` `0:0`. It also requires the expected aggregate to exist and pass exact
 CLI reconstruction. For a development run, verify
@@ -314,8 +355,10 @@ shell. After reconnecting, first restore `RUN_HEAD` from the SHA printed by the
 preflight.
 
 ```bash
+POST_HEAD="$(git rev-parse --verify 'HEAD^{commit}')" &&
+[[ "$POST_HEAD" =~ ^[0-9a-f]{40}$ ]] &&
 test -n "${RUN_HEAD:-}" &&
-test "$(git rev-parse HEAD)" = "$RUN_HEAD" &&
+test "$POST_HEAD" = "$RUN_HEAD" &&
 printf 'postflight HEAD unchanged: %s\n' "$RUN_HEAD"
 ```
 
