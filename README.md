@@ -24,8 +24,32 @@ is the same non-positive constant for every candidate, so it supplies no
 ranking signal. The project retains this identity as a negative control rather
 than presenting self-teaching as the confirmatory method.
 
-This repository currently contains the locked protocol and software
-foundations. It makes no experimental-results claim.
+## Current evidence
+
+The locked v0 result is negative for the proposed selector. Across eight assays
+and five seeds, full-Hessian influence selection was `-0.05526` Spearman below
+random pseudo-label selection, with 0/8 assay wins. Cross-fitted outer gradients
+and much smaller pseudo perturbations did not repair the ranking.
+
+The strongest diagnostic replaced the influence approximation entirely with
+exact four-fold validation-risk greedy selection. It still underperformed
+random by `0.43205` MSE and `0.04635` Spearman on the eight-assay exposed
+screen. Its validation loss improved sharply while hidden-test performance
+worsened, identifying adaptive validation overfitting / surrogate mismatch as
+a deeper failure than Hessian geometry alone. The preregistered gate failed,
+so 26 untouched assay outcomes remain sealed.
+
+Detailed, hash-bound decisions are tracked in:
+
+- [`docs/results/v0-decision.md`](docs/results/v0-decision.md)
+- [`docs/results/crossfit-decision.md`](docs/results/crossfit-decision.md)
+- [`docs/results/locality-decision.md`](docs/results/locality-decision.md)
+- [`docs/results/exact-cv-decision.md`](docs/results/exact-cv-decision.md)
+
+These findings apply to the frozen ProteinGym/ESM1v/ESM-2-ridge setup. They do
+not establish that pseudo-label selection is impossible in other protein
+fitness regimes. The theory-to-experiment limitations are recorded in
+[`docs/research/theory-audit.md`](docs/research/theory-audit.md).
 
 ## Sources
 
