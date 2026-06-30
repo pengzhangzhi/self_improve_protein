@@ -166,9 +166,8 @@ fi
 
 Proceed only if the command prints the immutable head and exits 0. Do not edit
 the checkout or resync, replace, or otherwise change `.venv` until postflight
-verification finishes. The final comparison below assumes this same shell. If
-you reconnect, record the printed SHA externally and restore that exact value to
-`RUN_HEAD` before postflight.
+verification finishes. If you reconnect, use the effective-state snapshot and
+restore guard below rather than recomputing run paths.
 
 ### Development pilot
 
@@ -207,32 +206,114 @@ This is not authorization to access or reveal the 26 designated untouched assay
 outcomes. They remain sealed, and this guide intentionally provides no substitute
 or fabricated gate value.
 
-### Reconnect to an in-flight run
+### Save the non-secret reconnect snapshot
 
-Before leaving the original shell, print and save this non-secret context in
-approved operator notes, not in the repository:
+After the launcher exits 0, create this mode-600 snapshot beside `job_ids.json`
+and record the printed path. It preserves effective path overrides and run
+identity using Bash-safe quoting. It intentionally contains no account,
+partition, `SI_SLURM_CONF`, or `SI_R5_GATE` value.
 
 ```bash
-printf 'cd -- %q\nexport SI_RUN_ID=%q\nexport SI_MODE=%q\nRUN_HEAD=%q\n' \
-  "$(pwd -P)" "$SI_RUN_ID" "$SI_MODE" "$RUN_HEAD"
+(
+  set -euo pipefail
+  required=(
+    SI_REPO_ROOT SI_CONFIG SI_MANIFEST SI_PROCESSED_ROOT
+    SI_EMBEDDING_ROOT SI_RESULTS_ROOT SI_RUN_ID SI_MODE RUN_HEAD
+  )
+  for name in "${required[@]}"; do
+    if [[ ! -v "$name" ]] || [[ -z "${!name}" ]]; then
+      printf 'missing reconnect value: %s\n' "$name" >&2
+      exit 1
+    fi
+  done
+  [[ "$RUN_HEAD" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$SI_MODE" == development || "$SI_MODE" == confirmatory ]]
+  physical_root="$(git rev-parse --show-toplevel)"
+  physical_root="$(cd -- "$physical_root" && pwd -P)"
+  test "$physical_root" = "$SI_REPO_ROOT"
+
+  run_dir="${SI_REPO_ROOT}/local/slurm/${SI_RUN_ID}"
+  test -f "${run_dir}/job_ids.json"
+  context_file="${run_dir}/reconnect_context.sh"
+  temporary="${context_file}.tmp"
+  trap 'rm -f -- "$temporary"' EXIT
+  umask 077
+  {
+    printf 'export SI_REPO_ROOT=%q\n' "$SI_REPO_ROOT"
+    printf 'export SI_CONFIG=%q\n' "$SI_CONFIG"
+    printf 'export SI_MANIFEST=%q\n' "$SI_MANIFEST"
+    printf 'export SI_PROCESSED_ROOT=%q\n' "$SI_PROCESSED_ROOT"
+    printf 'export SI_EMBEDDING_ROOT=%q\n' "$SI_EMBEDDING_ROOT"
+    printf 'export SI_RESULTS_ROOT=%q\n' "$SI_RESULTS_ROOT"
+    printf 'export SI_RUN_ID=%q\n' "$SI_RUN_ID"
+    printf 'export SI_MODE=%q\n' "$SI_MODE"
+    printf 'RUN_HEAD=%q\n' "$RUN_HEAD"
+  } > "$temporary"
+  chmod 600 "$temporary"
+  mv -- "$temporary" "$context_file"
+  trap - EXIT
+  printf 'non-secret reconnect context: %s\n' "$context_file"
+)
 ```
 
-In a new login shell:
+### Reconnect to an in-flight run
 
-1. Run the recorded `cd` line to return to the exact dedicated worktree.
-2. Rerun the seven site-configuration exports and the derived-path export block
-   above. This restores `SI_REPO_ROOT`, `SLURM_CONF`, and every artifact root.
-3. Run the recorded `SI_RUN_ID`, `SI_MODE`, and `RUN_HEAD` assignments exactly;
-   do not generate a new run ID.
-4. If `SI_MODE=confirmatory`, re-enter the same authorized `SI_R5_GATE` value and
-   export it. The gate is intentionally absent from the recorded context.
+In a new login shell, use this order:
 
-Validate the restored non-secret context before monitoring or postflight:
+1. Return to the exact dedicated worktree named in the recorded context path.
+2. Re-enter the seven site-configuration values from the configuration block.
+   Do not recompute the derived paths.
+3. Read the exact context path printed after submission, then source it:
+
+   ```bash
+   read -r -p 'Exact reconnect context path: ' CONTEXT_FILE
+   if [[ ! -f "$CONTEXT_FILE" ]]; then
+     printf 'missing reconnect context: %s\n' "$CONTEXT_FILE" >&2
+     false
+   elif ! source "$CONTEXT_FILE"; then
+     printf 'failed to source reconnect context\n' >&2
+     false
+   else
+     export SLURM_CONF="$SI_SLURM_CONF"
+   fi
+   ```
+
+4. For `SI_MODE=confirmatory`, re-enter and export the same authorized
+   `SI_R5_GATE`. It is intentionally absent from the snapshot.
+
+Before **every** monitoring, cancellation, or postflight command below, run this
+fail-closed guard. Do not continue unless it prints the success line:
 
 ```bash
-test -n "$SI_RUN_ID" &&
-[[ "$SI_MODE" == development || "$SI_MODE" == confirmatory ]] &&
-[[ "$RUN_HEAD" =~ ^[0-9a-f]{40}$ ]]
+(
+  set -euo pipefail
+  required=(
+    SI_ACCOUNT SI_CPU_PARTITION SI_GPU_PARTITION SI_REPO_ROOT
+    SI_DATA_ROOT SI_ARTIFACT_ROOT SI_SLURM_CONF SLURM_CONF
+    SI_CONFIG SI_MANIFEST SI_PROCESSED_ROOT SI_EMBEDDING_ROOT
+    SI_RESULTS_ROOT SI_RUN_ID SI_MODE RUN_HEAD
+  )
+  for name in "${required[@]}"; do
+    if [[ ! -v "$name" ]] || [[ -z "${!name}" ]]; then
+      printf 'missing restored value: %s\n' "$name" >&2
+      exit 1
+    fi
+  done
+  [[ "$SI_MODE" == development || "$SI_MODE" == confirmatory ]]
+  [[ "$RUN_HEAD" =~ ^[0-9a-f]{40}$ ]]
+  if [[ "$SI_MODE" == confirmatory && -z "${SI_R5_GATE:-}" ]]; then
+    printf 'confirmatory reconnect requires the authorized SI_R5_GATE\n' >&2
+    exit 1
+  fi
+  current_root="$(git rev-parse --show-toplevel)"
+  current_root="$(cd -- "$current_root" && pwd -P)"
+  current_head="$(git rev-parse --verify 'HEAD^{commit}')"
+  [[ "$current_head" =~ ^[0-9a-f]{40}$ ]]
+  test "$current_root" = "$SI_REPO_ROOT"
+  test "$current_head" = "$RUN_HEAD"
+  test "$SLURM_CONF" = "$SI_SLURM_CONF"
+  printf 'restored run context verified: %s %s\n' "$SI_RUN_ID" "$RUN_HEAD"
+)
 ```
 
 ## Monitor, cancel, and verify
@@ -350,9 +431,8 @@ The terminal CLI event must report `"status":"complete"` and include
 `"aggregate"` in its verified list. Scheduler completion without this artifact
 check is not a successful experiment run.
 
-Finally, check that the checkout still matches the head recorded in the same
-shell. After reconnecting, first restore `RUN_HEAD` from the SHA printed by the
-preflight.
+Finally, after the restore guard passes, independently check that the checkout
+still matches the snapshotted head:
 
 ```bash
 POST_HEAD="$(git rev-parse --verify 'HEAD^{commit}')" &&
