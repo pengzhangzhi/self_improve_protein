@@ -1,5 +1,6 @@
 """Assay-clustered summaries and predeclared v0 decision rules."""
 
+from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral, Real
@@ -356,8 +357,23 @@ def _paired_deltas(
     )
 
 
+def _all_integer_sign_sums(values: tuple[int, ...]) -> list[int]:
+    """Enumerate integer sign sums for one meet-in-the-middle partition."""
+    sums = [0]
+    for value in values:
+        sums = [partial + value for partial in sums] + [
+            partial - value for partial in sums
+        ]
+    return sums
+
+
 def exact_sign_flip_pvalue(assay_deltas: ArrayLike) -> float:
-    """Enumerate the exact two-sided sign-flip null over binary64 inputs."""
+    """Compute the exact two-sided sign-flip null over binary64 inputs.
+
+    Binary64 values are first represented as integers with a common power-of-two
+    denominator. A meet-in-the-middle count then evaluates all ``2**A`` sign
+    assignments exactly while storing and scanning only ``O(2**(A/2))`` sums.
+    """
     try:
         deltas = np.asarray(assay_deltas, dtype=np.float64)
     except (TypeError, ValueError) as error:
@@ -366,7 +382,7 @@ def exact_sign_flip_pvalue(assay_deltas: ArrayLike) -> float:
         raise ValueError("assay_deltas must be a non-empty 1D array")
     if not np.all(np.isfinite(deltas)):
         raise ValueError("assay_deltas must be finite")
-    assay_count = deltas.size
+    assay_count = int(deltas.size)
     total_assignments = 1 << assay_count
     ratios = [float(delta).as_integer_ratio() for delta in deltas]
     common_denominator = max(denominator for _, denominator in ratios)
@@ -375,16 +391,23 @@ def exact_sign_flip_pvalue(assay_deltas: ArrayLike) -> float:
         for numerator, denominator in ratios
     )
     observed = abs(sum(integer_deltas))
+    if observed == 0:
+        return 1.0
+
+    midpoint = assay_count // 2
+    left_sums = _all_integer_sign_sums(integer_deltas[:midpoint])
+    right_sums = sorted(_all_integer_sign_sums(integer_deltas[midpoint:]))
+    right_count = len(right_sums)
     extreme_count = 0
-    for mask in range(total_assignments):
-        permuted = abs(
-            sum(
-                delta if (mask >> index) & 1 else -delta
-                for index, delta in enumerate(integer_deltas)
-            )
+    for left_sum in left_sums:
+        extreme_count += bisect_right(
+            right_sums,
+            -observed - left_sum,
         )
-        if permuted >= observed:
-            extreme_count += 1
+        extreme_count += right_count - bisect_left(
+            right_sums,
+            observed - left_sum,
+        )
     return extreme_count / total_assignments
 
 

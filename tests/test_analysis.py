@@ -189,6 +189,39 @@ def test_exact_sign_flip_enumerates_all_2_to_the_a_assignments() -> None:
     assert exact_sign_flip_pvalue(cancellation_ties) == 192 / 256
 
 
+def _brute_force_exact_sign_flip_pvalue(deltas: np.ndarray) -> float:
+    ratios = [float(delta).as_integer_ratio() for delta in deltas]
+    denominator = max(value[1] for value in ratios)
+    integers = tuple(
+        numerator * (denominator // local_denominator)
+        for numerator, local_denominator in ratios
+    )
+    observed = abs(sum(integers))
+    extreme = 0
+    for mask in range(1 << len(integers)):
+        signed = sum(
+            value if (mask >> index) & 1 else -value
+            for index, value in enumerate(integers)
+        )
+        extreme += abs(signed) >= observed
+    return extreme / (1 << len(integers))
+
+
+def test_exact_sign_flip_matches_brute_force_for_small_binary64_inputs() -> None:
+    generator = np.random.Generator(np.random.PCG64(917))
+    for assay_count in range(1, 11):
+        deltas = generator.normal(size=assay_count)
+        assert exact_sign_flip_pvalue(deltas) == (
+            _brute_force_exact_sign_flip_pvalue(deltas)
+        )
+
+
+def test_exact_sign_flip_scales_exactly_to_26_assays() -> None:
+    deltas = np.ones(26, dtype=np.float64)
+    assert exact_sign_flip_pvalue(deltas) == 2 / (1 << 26)
+    assert exact_sign_flip_pvalue(np.zeros(26, dtype=np.float64)) == 1.0
+
+
 def test_hierarchical_bootstrap_is_deterministic_and_resamples_both_levels() -> None:
     table = _complete_results()
     # Add seed variation to distinguish seed-within-assay resampling from a
