@@ -64,19 +64,27 @@ that same locked configuration. The processed, embedding, and results roots must
 be writable. `prepare-data` creates the immutable manifest consumed by all later
 stages; an existing non-identical manifest is rejected rather than overwritten.
 
-| Stage | Required inputs | Output or check |
-| --- | --- | --- |
-| `prepare-data` | Pinned substitution, zero-shot-score, and metadata files; locked config; writable processed root | Checksum-verified processed assay tables and immutable data manifest |
-| `embed-assay` | Manifest, one processed assay, frozen ESM-2 checkpoint, writable embedding root | Revision- and row-bound `.npy` embedding cache plus JSON metadata |
-| `run-task` | Manifest, processed data, embeddings, locked mode/task grid, writable results root | One provenance-locked assay-seed task JSON |
-| `aggregate` | Manifest, processed data, embeddings, and the complete expected task grid | Reconstructed tables, diagnostics, and `<results-root>/<mode>/aggregate.json` |
-| `verify` | Manifest plus any processed, embedding, task, aggregate, or gate artifacts being checked | Fail-closed validation; the postflight invocation below is read-only |
+The five stages have narrow contracts:
+
+- `prepare-data`: verify the three pinned sources; write processed tables and the
+  immutable manifest.
+- `embed-assay`: combine one manifest-bound table with frozen ESM-2; write its
+  `.npy` cache and JSON metadata.
+- `run-task`: combine the manifest, processed data, embeddings, and locked grid;
+  write one assay-seed task JSON.
+- `aggregate`: reconstruct the complete task grid; write tables, diagnostics,
+  and `<results-root>/<mode>/aggregate.json`.
+- `verify`: fail closed on the supplied manifest and artifacts; the postflight
+  invocation below is read-only.
 
 By default, preparation reads
 `$SI_DATA_ROOT/raw/DMS_ProteinGym_substitutions.zip`,
 `$SI_DATA_ROOT/raw/zero_shot_substitutions_scores.zip`, and
 `$SI_DATA_ROOT/raw/DMS_substitutions.csv`. The batch script also accepts the
 explicit `SI_DMS_ZIP`, `SI_SCORES_ZIP`, and `SI_METADATA_CSV` overrides.
+Preparation does not fetch those archives. If compute nodes cannot reach the
+model registry, pre-cache the exact configured ESM-2 model and revision in a
+cache visible to them before submission.
 
 ## Configure the cluster launcher
 
@@ -91,6 +99,7 @@ export SI_REPO_ROOT="$(pwd)"
 export SI_DATA_ROOT="/path/to/project-data"
 export SI_ARTIFACT_ROOT="/path/to/project-artifacts"
 export SI_SLURM_CONF="/path/to/slurm.conf"
+export SLURM_CONF="$SI_SLURM_CONF"
 ```
 
 `slurm/submit_pipeline.sh` requires those seven variables. It derives and exports
@@ -117,10 +126,39 @@ export SI_EMBEDDING_ROOT="${SI_EMBEDDING_ROOT:-${SI_DATA_ROOT}/embeddings/v0}"
 export SI_RESULTS_ROOT="${SI_RESULTS_ROOT:-${SI_ARTIFACT_ROOT}/studies/v0}"
 ```
 
+Slurm client commands consume `SLURM_CONF`, not `SI_SLURM_CONF`. Exporting both
+in the parent shell keeps submission, `squeue`, `sacct`, and `scancel` on the
+intended controller. Repeat the site export block after opening a new shell.
+
 ## Submit the pipeline
 
 All stages are chained with `afterok`: a downstream job starts only after its
 dependency succeeds.
+
+`slurm/submit_pipeline.sh` is not a generic experiment launcher. It enforces the
+canonical v0 protocol digest and invokes the fixed v0 task implementation in its
+v0 artifact namespace.
+
+### Immutable-run preflight
+
+Use a dedicated worktree. Immediately before either submission block, run this
+preflight in the same shell that you will keep through postflight:
+
+```bash
+RUN_HEAD="$(git rev-parse HEAD)"
+if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+  printf 'submission requires a clean dedicated worktree\n' >&2
+  false
+else
+  printf 'immutable run HEAD: %s\n' "$RUN_HEAD"
+fi
+```
+
+Proceed only if the command prints the immutable head and exits 0. Do not edit
+the checkout or resync, replace, or otherwise change `.venv` until postflight
+verification finishes. The final comparison below assumes this same shell. If
+you reconnect, record the printed SHA externally and restore that exact value to
+`RUN_HEAD` before postflight.
 
 ### Development pilot
 
@@ -161,16 +199,56 @@ or fabricated gate value.
 
 ## Monitor, cancel, and verify
 
-Submission prints the path to and incrementally writes
-`local/slurm/<run-id>/job_ids.json`. Inspect the recorded `jobs.prepare`,
-`jobs.embed`, `jobs.task`, and `jobs.aggregate` values:
+The launcher incrementally writes `local/slurm/<run-id>/job_ids.json`; a
+successful submission also prints that path. Inspect the recorded
+`jobs.prepare`, `jobs.embed`, `jobs.task`, and `jobs.aggregate` values:
 
 ```bash
 python -m json.tool "local/slurm/${SI_RUN_ID}/job_ids.json"
 ```
 
-Substitute those four numeric values for `PREPARE_ID`, `EMBED_ID`, `TASK_ID`,
-and `AGGREGATE_ID`. Both commands below are read-only scheduler queries:
+The launcher is non-atomic: it submits one stage at a time. If it exits nonzero
+after creating the manifest, immediately cancel every non-null recorded job ID
+before diagnosing or retrying. This recovery runs in a subshell, validates IDs,
+skips `null`, and lets `scancel` inherit the parent shell's `SLURM_CONF`.
+
+**CANCELS CLUSTER JOBS**
+
+```bash
+(
+  set -euo pipefail
+  job_manifest="local/slurm/${SI_RUN_ID}/job_ids.json"
+  test -f "$job_manifest" || {
+    printf 'missing job manifest: %s\n' "$job_manifest" >&2
+    exit 1
+  }
+  .venv/bin/python - "$job_manifest" <<'PY'
+import json
+import subprocess
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+jobs = payload.get("jobs")
+if not isinstance(jobs, dict):
+    raise SystemExit("job manifest has no jobs object")
+job_ids = []
+for name in ("prepare", "embed", "task", "aggregate"):
+    value = jobs.get(name)
+    if value is None:
+        continue
+    if not isinstance(value, str) or not value.isdecimal():
+        raise SystemExit(f"invalid {name} job ID")
+    job_ids.append(value)
+if job_ids:
+    subprocess.run(["scancel", *job_ids], check=True)
+PY
+)
+```
+
+For a fully submitted chain, all four values are non-null. Substitute them for
+`PREPARE_ID`, `EMBED_ID`, `TASK_ID`, and `AGGREGATE_ID`. Both commands below are
+read-only scheduler queries:
 
 ```bash
 squeue --jobs PREPARE_ID,EMBED_ID,TASK_ID,AGGREGATE_ID
@@ -188,8 +266,9 @@ slurm-sip-task-<array-job-id>_<index>.out/.err
 slurm-sip-aggregate-<job-id>.out/.err
 ```
 
-To stop a submitted chain, include the downstream pending IDs as well as any
-running ID.
+The concise cancellation command below applies only when all four IDs exist. It
+includes downstream pending jobs as well as any running job; use the manifest
+recovery above for a partial submission.
 
 **CANCELS CLUSTER JOBS**
 
@@ -203,7 +282,7 @@ CLI reconstruction. For a development run, verify
 `${SI_RESULTS_ROOT}/development/aggregate.json` with:
 
 ```bash
-OPENBLAS_CORETYPE=Haswell uv run self-improve-protein \
+OPENBLAS_CORETYPE=Haswell .venv/bin/self-improve-protein \
   --config "$SI_CONFIG" verify \
   --manifest "$SI_MANIFEST" \
   --processed-root "$SI_PROCESSED_ROOT" \
@@ -216,7 +295,7 @@ For an authorized confirmatory run, verification must consume the same gate and
 the confirmatory aggregate:
 
 ```bash
-OPENBLAS_CORETYPE=Haswell uv run self-improve-protein \
+OPENBLAS_CORETYPE=Haswell .venv/bin/self-improve-protein \
   --config "$SI_CONFIG" verify \
   --manifest "$SI_MANIFEST" \
   --processed-root "$SI_PROCESSED_ROOT" \
@@ -230,10 +309,25 @@ The terminal CLI event must report `"status":"complete"` and include
 `"aggregate"` in its verified list. Scheduler completion without this artifact
 check is not a successful experiment run.
 
+Finally, check that the checkout still matches the head recorded in the same
+shell. After reconnecting, first restore `RUN_HEAD` from the SHA printed by the
+preflight.
+
+```bash
+test -n "${RUN_HEAD:-}" &&
+test "$(git rev-parse HEAD)" = "$RUN_HEAD" &&
+printf 'postflight HEAD unchanged: %s\n' "$RUN_HEAD"
+```
+
 ## Extend the study safely
 
 Follow the [R0--R7 feedback ladder](research/feedback-ladder.md) rather than
-tuning directly on completed outcomes:
+tuning directly on completed outcomes. A new method cannot simply use the v0
+launcher: it needs a separately reviewed task launcher and a separate artifact
+namespace. The committed [cross-fit](../slurm/submit_crossfit_screen.sh),
+[locality](../slurm/submit_locality_screen.sh), and
+[exact-CV](../slurm/submit_exact_cv_screen.sh) screen launchers are specialized
+examples for their own cards, not generic launchers for arbitrary methods.
 
 1. Write a new experiment card and state the one factor changed from its
    baseline. Use the existing [v0](research/experiment-card-v0.md),
@@ -243,14 +337,16 @@ tuning directly on completed outcomes:
    [exact-CV](research/experiment-card-exact-cv.md) cards as concrete templates.
 2. Add focused tests for the new mechanism, then run the complete local R1--R3
    contract.
-3. Arrange an explicit reduced real-data R4 smoke with a maintainer. The public
+3. Review the method-specific launcher and its separate artifact namespace.
+4. Arrange an explicit reduced real-data R4 smoke with a maintainer. The public
    repository defines the R4 evidence bar but has no dedicated one-command R4
    launcher; do not relabel the larger development pipeline as R4.
-4. Run the R5-style development pilot and review its finite metrics, diagnostics,
+5. Run the reviewed R5-style development pilot and inspect its metrics, diagnostics,
    reproducibility, and launcher evidence.
-5. Lock the reviewed artifacts and arrange the promotion gate. Run confirmation
-   only when that gate and the execution are explicitly authorized.
-6. Record the result in a separate decision memo without rewriting the original
+6. Lock the reviewed artifacts. Gate issuance is study-specific and
+   maintainer-controlled; there is no generic public issuance procedure.
+7. Run confirmation only when its gate and execution are explicitly authorized.
+8. Record the result in a separate decision memo without rewriting the original
    card or its success rule.
 
 Operational success proves that the declared code and artifact path executed; it
