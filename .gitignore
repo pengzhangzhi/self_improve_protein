@@ -1,4 +1,5 @@
 # Python environments and generated package output
+.worktrees/
 .venv/
 venv/
 build/
