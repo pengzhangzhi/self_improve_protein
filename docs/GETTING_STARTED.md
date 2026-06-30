@@ -19,8 +19,8 @@ Choose the route that matches what you need today:
 A **protein sequence** is an ordered chain of amino acids. Code represents it as
 a string over the 20 standard one-letter amino-acid symbols. Changing one amino
 acid creates a **substitution variant**. For example, `A42V` means that alanine
-(`A`) at sequence position 42 is replaced by valine (`V`); the numbering belongs
-to that assay's reference sequence.
+(`A`) at sequence position 42 is replaced by valine (`V`); the numbering follows
+the experiment's reference sequence.
 
 A biological **assay** is a laboratory procedure that measures a particular
 property, such as activity, binding, or growth. **Deep mutational scanning
@@ -49,7 +49,7 @@ deterministic 6,000-variant working set:
 | --- | ---: | --- |
 | `n` | 96 | Labeled variants available to fit and calibrate models |
 | `N_U` | 2,000 | Candidate variants whose true DMS scores are hidden during selection |
-| `N_test` | 1,000 | Held-out variants used only after fitting |
+| `N_test` | 1,000 | Sealed test variants unavailable until final evaluation |
 | `q` | 192 | Candidates selected for pseudo-labeling |
 | `w` | 0.1 | Training weight of each pseudo-labeled candidate |
 
@@ -62,8 +62,9 @@ training weight is therefore `96 + 19.2 = 115.2`, and pseudo-labels contribute
 The model pipeline has four stages:
 
 1. **Representation.** ESM-2, a pretrained protein language model, converts
-   each sequence into a 480-number **embedding** by averaging its residue
-   representations. Its model parameters are not trained in this study.
+   each sequence into a 480-number **embedding**. A **residue** is the amino
+   acid at one sequence position; ESM-2 averages its residue representations.
+   Its model parameters are not trained in this study.
 2. **External teacher.** ProteinGym's `ESM1v_ensemble` predicts mutation effects
    from sequence without fitting to this assay, often called a *zero-shot*
    score. A slope and intercept fitted on the 96 labels align those scores to
@@ -71,7 +72,9 @@ The model pipeline has four stages:
    pseudo-labels.
 3. **Student.** A linear ridge regressor predicts standardized DMS score from
    the ESM-2 embedding. Ridge adds a quadratic penalty to stabilize a
-   480-feature fit from only 96 labels.
+   480-feature fit from only 96 labels. Before fitting, the code centers
+   embeddings with labeled-only means and divides by one scalar
+   root-mean-square (RMS) scale.
 4. **Selection and refit.** A method chooses 192 of the 2,000 candidates. The
    student is refit on the 96 real labels plus those weighted pseudo-labels,
    then evaluated on the test split.
@@ -142,7 +145,7 @@ Keep three claims separate:
 1. The manuscript theorem concerns a local population-risk expansion.
 2. The implemented score adapts that idea to fixed-cardinality selection from a
    finite candidate pool using external pseudo-labels.
-3. The experiment asks whether that adapted ranking improves held-out protein
+3. The experiment asks whether that adapted ranking improves test-set protein
    fitness prediction relative to random selection.
 
 The [theory-to-experiment audit](research/theory-audit.md) gives the derivation
@@ -159,17 +162,18 @@ had already been viewed in v0 or development. These later studies diagnose why
 the method behaved as it did; they do not replace the v0 result.
 
 Exact-CV reuses the same 96 labels in four folds. At each selection step, a fold
-fits on 72 labels and uses the other 24 as validation data. Those validation
-labels are consulted repeatedly while choosing 192 candidates. The separate
-1,000-variant test labels remain unavailable until the candidate order, final
-student fit, and predictions are fixed.
+fits on 72 labels and uses the other 24 as validation data. Those 24 are
+excluded from that fold's fit but deliberately reused while choosing 192
+candidates. The separate 1,000-variant sealed test labels are unavailable to
+fitting, selection, and tuning until final evaluation, after the candidate
+order, student fit, and predictions are fixed.
 
 | Study | Question | Answer |
 | --- | --- | --- |
 | **v0** | Does full influence ranking beat random when labels and retraining are fixed? | No. The full selector lost on the primary paired comparison. |
 | **Crossfit** | Is the in-sample outer gradient the problem? | Replacing it with a four-fold out-of-fold gradient did not improve selection. |
 | **Locality** | Is the 192-point, weight-0.1 update too large for a first-order score? | Smaller updates made the parameter approximation more faithful, but full-Hessian and cross-fitted influence each failed to beat random in all 15 cells. |
-| **Exact-CV** | Does exact greedy held-out-loss lookahead work after removing the Hessian and Taylor approximations? | It fit the reused validation folds strongly but generalized worse than random. |
+| **Exact-CV** | Does exact greedy fold-validation-loss lookahead work after removing the Hessian and Taylor approximations? | It fit the reused validation folds strongly but generalized worse than random. |
 
 At one locality-grid setting (`q=72`, `w=0.1`), no-Hessian was `+0.00654`
 Spearman above random. This descriptive result was not significant (assay
@@ -196,9 +200,12 @@ Spearman was `0.30336` versus `0.34971`. This is consistent with adaptive
 validation overfitting and/or a mismatch between the selection surrogate and
 test performance; the study does not identify one unique cause.
 
-All exploratory promotion gates failed, so the 26 designated untouched assay
-outcomes remain sealed. The authoritative interpretation, including evidence
-hashes, is in the [overall conclusion](results/overall-conclusion.md).
+A **promotion gate** is a criterion written before a study for deciding whether
+to proceed to untouched assays. Every exploratory gate failed, so the 26
+designated untouched assay outcomes remain **sealed**: they were not read,
+summarized, or used for selection or tuning. The authoritative interpretation,
+including evidence hashes, is in the [overall
+conclusion](results/overall-conclusion.md).
 
 ## First code tour
 
@@ -228,7 +235,8 @@ Python 3.11 or newer and [uv](https://docs.astral.sh/uv/) are required.
 
 ### Fast orientation
 
-This path does not install Torch or require a GPU:
+The clone and first sync require network access. This path does not install
+Torch or require a GPU:
 
 ```bash
 git clone https://github.com/pengzhangzhi/self_improve_protein.git
@@ -238,9 +246,10 @@ uv run self-improve-protein --show-config
 uv run self-improve-protein --help
 ```
 
-`uv sync --frozen` creates or updates the project-local `.venv` from the exact
-`uv.lock` environment. `uv run` executes the following command inside that
-environment, so you do not need to activate it manually. The config command
+`uv sync --frozen` creates or updates the project-local `.venv` using the
+applicable base-package versions recorded in `uv.lock`; it does not install the
+optional developer or embedding groups. `uv run` executes the following command
+inside `.venv`, so you do not need to activate it manually. The config command
 prints one validated JSON record; help lists the pipeline stages. Both are
 CPU-only and take seconds after installation.
 
@@ -280,8 +289,14 @@ The [pipeline launcher](../slurm/submit_pipeline.sh) expects site-specific
 `SI_ACCOUNT`, `SI_CPU_PARTITION`, `SI_GPU_PARTITION`, `SI_REPO_ROOT`,
 `SI_DATA_ROOT`, `SI_ARTIFACT_ROOT`, and `SI_SLURM_CONF` values. Keep their
 values private. It defaults to `SI_MODE=development`, which schedules two
-assay-seed tasks. The full eight-assay by five-seed study requires
-`SI_MODE=confirmatory` and `SI_R5_GATE` set to the filesystem path of a
+assay-seed tasks. One development submission creates this dependency-ordered
+footprint: one CPU preparation job, a nine-member GPU embedding array using one
+GPU per member, a two-member CPU task array, and one CPU aggregate job. Each
+stage waits for the preceding stage to succeed. The full eight-assay by
+five-seed study uses a 40-member task array and requires
+`SI_MODE=confirmatory`.
+
+Confirmatory mode also requires `SI_R5_GATE` set to the filesystem path of a
 completed, validated R5 verification-gate JSON. R5 records that the
 development-only pilot and its evidence passed; see the [verification
 ladder](research/feedback-ladder.md).
@@ -295,7 +310,11 @@ bash slurm/submit_pipeline.sh
 
 Expected output is the path to `local/slurm/<run-id>/job_ids.json`, which
 records the submitted prepare, embedding, task-array, and aggregate job IDs.
-This is not a local orientation command.
+This is not a local orientation command. Copy every non-null ID from that file.
+Monitor the pending/running chain with `squeue --job=ID1,ID2,ID3,ID4`. To stop
+the whole chain, pass all non-null IDs as separate arguments to
+`scancel ID1 ID2 ID3 ID4`; include downstream pending jobs as well as any
+running job. `squeue` is read-only, while `scancel` changes cluster state.
 
 ## Extending the study safely
 
@@ -308,8 +327,9 @@ Use this sequence for a new selector or research question:
 2. Preserve baseline parity. Reuse the same split, teacher predictions, `q`,
    `w`, student objective, random baseline, and metrics unless the card names a
    change. A method comparison should differ only where declared.
-3. Add focused tests, then run a development-only smoke task and pilot. Passing
-   them establishes execution and data-flow integrity, not method quality.
+3. Add focused tests, then run a [development-only smoke task and
+   pilot](research/feedback-ladder.md). Passing them establishes execution and
+   data-flow integrity, not method quality.
 4. Record and lock the implementation, config, selections, predictions, and
    traceability receipts before hidden outcomes enter evaluation.
 5. Apply the predeclared promotion gate. Use untouched outcomes only for an
@@ -331,7 +351,8 @@ Use this sequence for a new selector or research question:
 | Student | The ridge regressor trained on ESM-2 embeddings |
 | Hessian | Matrix describing local curvature of the fitted objective |
 | Influence score | First-order estimate used to rank a candidate's effect |
-| Held-out | Withheld from fitting or selection until the declared evaluation stage |
+| Fold-validation data | Labels excluded from one exact-CV fold fit but repeatedly reused to guide selection |
+| Sealed data | Outcomes unavailable to fitting, selection, and tuning until the declared evaluation; the 26 untouched assay outcomes were never opened |
 | Slurm | Cluster scheduler used for dependency-ordered CPU/GPU jobs |
 
 ## Sources of truth, in reading order
