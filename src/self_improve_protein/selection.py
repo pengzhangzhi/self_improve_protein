@@ -6,10 +6,12 @@ from typing import TypeAlias
 import numpy as np
 from numpy.typing import NDArray
 
+from self_improve_protein.provenance import derive_seed
 from self_improve_protein.ridge import (
     _as_float64_matrix,
     _as_float64_vector,
     _validated_ridge_lambda,
+    fit_weighted_ridge,
 )
 
 FloatArray: TypeAlias = NDArray[np.float64]
@@ -171,6 +173,175 @@ def _strict_integer(value: int, *, name: str) -> int:
     if type(value) is not int:
         raise ValueError(f"{name} must be an integer")
     return value
+
+
+def _nonempty_string(value: str, *, name: str) -> str:
+    """Return a non-empty string without coercing identifiers."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def balanced_fold_assignment(
+    sample_count: int,
+    assay_id: str,
+    seed: int,
+    *,
+    fold_count: int = 4,
+    purpose: str = "crossfit_outer_folds_v1",
+) -> IntArray:
+    """Assign samples to exactly balanced, purpose-separated PCG64 folds."""
+    size = _strict_integer(sample_count, name="sample_count")
+    folds = _strict_integer(fold_count, name="fold_count")
+    seed_value = _strict_integer(seed, name="seed")
+    assay = _nonempty_string(assay_id, name="assay_id")
+    stream_purpose = _nonempty_string(purpose, name="purpose")
+    if size <= 0:
+        raise ValueError("sample_count must be positive")
+    if folds < 2 or folds > size:
+        raise ValueError("fold_count must satisfy 2 <= fold_count <= sample_count")
+    if size % folds != 0:
+        raise ValueError("sample_count must be divisible by fold_count")
+    if seed_value < 0:
+        raise ValueError("seed must be non-negative")
+
+    generator = np.random.Generator(
+        np.random.PCG64(derive_seed(assay, seed_value, stream_purpose))
+    )
+    permutation = generator.permutation(size)
+    assignment = np.empty(size, dtype=np.int64)
+    assignment[permutation] = np.repeat(
+        np.arange(folds, dtype=np.int64),
+        size // folds,
+    )
+    return assignment
+
+
+def _validated_fold_assignment(
+    fold_assignment: IntArray,
+    *,
+    sample_count: int,
+) -> IntArray:
+    """Validate contiguous, exactly balanced integer fold identifiers."""
+    try:
+        raw = np.asarray(fold_assignment)
+    except (TypeError, ValueError) as error:
+        raise ValueError("fold_assignment must be an integer 1D array") from error
+    if raw.ndim != 1:
+        raise ValueError("fold_assignment must be a 1D array")
+    if raw.shape[0] != sample_count:
+        raise ValueError("fold_assignment length must match x_l rows")
+    if raw.dtype.kind not in {"i", "u"}:
+        raise ValueError("fold_assignment must contain integers")
+    if raw.dtype.kind == "u" and np.any(raw > np.iinfo(np.int64).max):
+        raise ValueError("fold_assignment values exceed int64")
+    assignment = np.asarray(raw, dtype=np.int64)
+    unique, counts = np.unique(assignment, return_counts=True)
+    if unique.size < 2 or not np.array_equal(
+        unique,
+        np.arange(unique.size, dtype=np.int64),
+    ):
+        raise ValueError("fold_assignment must use contiguous IDs starting at zero")
+    if np.any(counts != counts[0]):
+        raise ValueError("fold_assignment must be exactly balanced")
+    return assignment
+
+
+def out_of_fold_ridge_gradient(
+    x_l: FloatArray,
+    y_l: FloatArray,
+    fold_assignment: IntArray,
+    ridge_lambda: float,
+) -> FloatArray:
+    """Return the mean labeled gradient from held-out ridge residuals."""
+    labeled_features = _as_float64_matrix(x_l, name="x_l")
+    labeled_response = _as_float64_vector(y_l, name="y_l")
+    if labeled_features.shape[0] != labeled_response.shape[0]:
+        raise ValueError("x_l and y_l must have the same number of rows")
+    regularization = _validated_ridge_lambda(ridge_lambda)
+    assignment = _validated_fold_assignment(
+        fold_assignment,
+        sample_count=labeled_features.shape[0],
+    )
+    residuals = np.empty(labeled_features.shape[0], dtype=np.float64)
+    for fold in range(int(np.max(assignment)) + 1):
+        held_out = assignment == fold
+        theta_minus_fold = fit_weighted_ridge(
+            labeled_features[~held_out],
+            labeled_response[~held_out],
+            regularization,
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            residuals[held_out] = (
+                labeled_features[held_out] @ theta_minus_fold
+                - labeled_response[held_out]
+            )
+    with np.errstate(over="ignore", invalid="ignore"):
+        gradient = labeled_features.T @ residuals / labeled_features.shape[0]
+    if not np.all(np.isfinite(residuals)) or not np.all(np.isfinite(gradient)):
+        raise ValueError("out-of-fold residual gradient must be finite")
+    return np.asarray(gradient, dtype=np.float64)
+
+
+def cross_fitted_influence_scores(
+    x_l: FloatArray,
+    y_l: FloatArray,
+    x_u: FloatArray,
+    yhat_u: FloatArray,
+    theta: FloatArray,
+    ridge_lambda: float,
+    damping: float,
+    assay_id: str,
+    seed: int,
+    *,
+    fold_count: int = 4,
+    purpose: str = "crossfit_outer_folds_v1",
+) -> FloatArray:
+    """Score full-fit pseudo-gradients using a cross-fitted outer gradient."""
+    regularization = _validated_ridge_lambda(ridge_lambda)
+    damping_value = _validated_damping(damping)
+    (
+        labeled_features,
+        labeled_response,
+        unlabeled_features,
+        pseudo_response,
+        parameters,
+    ) = _validated_score_inputs(x_l, y_l, x_u, yhat_u, theta)
+    assignment = balanced_fold_assignment(
+        labeled_features.shape[0],
+        assay_id,
+        seed,
+        fold_count=fold_count,
+        purpose=purpose,
+    )
+    cross_fitted_gradient = out_of_fold_ridge_gradient(
+        labeled_features,
+        labeled_response,
+        assignment,
+        regularization,
+    )
+    full_gradient = _labeled_gradient(
+        labeled_features,
+        labeled_response,
+        parameters,
+    )
+    hessian = _regularized_hessian(labeled_features, regularization)
+    with np.errstate(over="ignore"):
+        system = hessian + damping_value * np.eye(
+            labeled_features.shape[1],
+            dtype=np.float64,
+        )
+    if not np.all(np.isfinite(system)):
+        raise ValueError("damped Hessian system must be finite")
+    try:
+        direction = np.linalg.solve(system, cross_fitted_gradient)
+    except np.linalg.LinAlgError as error:
+        raise np.linalg.LinAlgError("damped Hessian system is singular") from error
+    residual = unlabeled_features @ parameters - pseudo_response
+    scores = residual * (unlabeled_features @ direction) - full_gradient @ direction
+    if not np.all(np.isfinite(scores)):
+        raise ValueError("cross-fitted influence scores must be finite")
+    return np.asarray(scores, dtype=np.float64)
 
 
 def stable_top_k(

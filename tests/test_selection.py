@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
+import self_improve_protein.selection as selection_module
+from self_improve_protein.provenance import derive_seed
 from self_improve_protein.ridge import fit_weighted_ridge, squared_loss
 from self_improve_protein.selection import (
     influence_scores,
@@ -27,6 +29,230 @@ def _ridge_case() -> tuple[FloatArray, FloatArray, FloatArray, FloatArray, float
     teacher_theta = rng.normal(size=4)
     yhat_u = (x_u @ teacher_theta + rng.normal(scale=0.4, size=7)).astype(np.float64)
     return x_l, y_l, x_u, yhat_u, 0.23
+
+
+def test_balanced_fold_assignment_has_exact_disjoint_4_by_24_coverage() -> None:
+    assignment = selection_module.balanced_fold_assignment(
+        96,
+        "ADRB2_HUMAN_Jones_2020",
+        7,
+    )
+
+    assert assignment.dtype == np.int64
+    assert assignment.shape == (96,)
+    fold_members = [set(np.flatnonzero(assignment == fold)) for fold in range(4)]
+    assert [len(members) for members in fold_members] == [24, 24, 24, 24]
+    assert set.union(*fold_members) == set(range(96))
+    overlaps = (
+        first & second
+        for first in fold_members
+        for second in fold_members
+        if first is not second
+    )
+    assert all(not overlap for overlap in overlaps)
+
+
+def test_balanced_fold_assignment_matches_purpose_separated_pcg64_and_repeats() -> None:
+    assay_id = "ADRB2_HUMAN_Jones_2020"
+    seed = 7
+    purpose = "crossfit_outer_folds_v1"
+    permutation = np.random.Generator(
+        np.random.PCG64(derive_seed(assay_id, seed, purpose))
+    ).permutation(96)
+    expected = np.empty(96, dtype=np.int64)
+    expected[permutation] = np.repeat(np.arange(4, dtype=np.int64), 24)
+
+    default = selection_module.balanced_fold_assignment(96, assay_id, seed)
+    explicit = selection_module.balanced_fold_assignment(
+        96,
+        assay_id,
+        seed,
+        purpose=purpose,
+    )
+    repeated = selection_module.balanced_fold_assignment(96, assay_id, seed)
+
+    np.testing.assert_array_equal(default, expected)
+    np.testing.assert_array_equal(explicit, expected)
+    np.testing.assert_array_equal(repeated, expected)
+
+
+def test_balanced_fold_assignment_changes_with_purpose() -> None:
+    default = selection_module.balanced_fold_assignment(
+        96,
+        "ADRB2_HUMAN_Jones_2020",
+        7,
+        purpose="crossfit_outer_folds_v1",
+    )
+    alternate = selection_module.balanced_fold_assignment(
+        96,
+        "ADRB2_HUMAN_Jones_2020",
+        7,
+        purpose="crossfit_outer_folds_sensitivity_v1",
+    )
+
+    assert not np.array_equal(default, alternate)
+
+
+def test_out_of_fold_ridge_gradient_matches_explicit_fold_fits() -> None:
+    rng = np.random.default_rng(8128)
+    x_l = rng.normal(size=(12, 3)).astype(np.float64)
+    y_l = rng.normal(size=12).astype(np.float64)
+    ridge_lambda = 0.17
+    folds = np.tile(np.arange(4, dtype=np.int64), 3)
+    expected_residuals = np.empty(12, dtype=np.float64)
+    for fold in range(4):
+        held_out = folds == fold
+        theta_minus_fold = fit_weighted_ridge(
+            x_l[~held_out],
+            y_l[~held_out],
+            ridge_lambda,
+        )
+        expected_residuals[held_out] = x_l[held_out] @ theta_minus_fold - y_l[held_out]
+    expected = x_l.T @ expected_residuals / x_l.shape[0]
+
+    actual = selection_module.out_of_fold_ridge_gradient(
+        x_l,
+        y_l,
+        folds,
+        ridge_lambda,
+    )
+
+    assert actual.dtype == np.float64
+    np.testing.assert_allclose(actual, expected, atol=1e-14, rtol=1e-13)
+
+
+def test_cross_fitted_scores_match_hand_computed_v0_candidate_and_hessian_pieces() -> (
+    None
+):
+    rng = np.random.default_rng(417)
+    x_l = rng.normal(size=(12, 3)).astype(np.float64)
+    y_l = rng.normal(size=12).astype(np.float64)
+    x_u = rng.normal(size=(7, 3)).astype(np.float64)
+    yhat_u = rng.normal(size=7).astype(np.float64)
+    ridge_lambda = 0.19
+    damping = 0.03
+    assay_id = "TINY_ASSAY"
+    seed = 11
+    purpose = "crossfit_outer_folds_v1"
+    theta = fit_weighted_ridge(x_l, y_l, ridge_lambda)
+    folds = selection_module.balanced_fold_assignment(
+        x_l.shape[0],
+        assay_id,
+        seed,
+        purpose=purpose,
+    )
+    oof_residuals = np.empty(x_l.shape[0], dtype=np.float64)
+    for fold in range(4):
+        held_out = folds == fold
+        theta_minus_fold = fit_weighted_ridge(
+            x_l[~held_out],
+            y_l[~held_out],
+            ridge_lambda,
+        )
+        oof_residuals[held_out] = x_l[held_out] @ theta_minus_fold - y_l[held_out]
+    g_cf = x_l.T @ oof_residuals / x_l.shape[0]
+    g_l = x_l.T @ (x_l @ theta - y_l) / x_l.shape[0]
+    hessian = x_l.T @ x_l / x_l.shape[0] + ridge_lambda * np.eye(3)
+    system = hessian + damping * np.eye(3)
+    candidate_gradients = (x_u @ theta - yhat_u)[:, None] * x_u
+    expected = np.array(
+        [
+            g_cf @ np.linalg.solve(system, candidate_gradient - g_l)
+            for candidate_gradient in candidate_gradients
+        ],
+        dtype=np.float64,
+    )
+
+    actual = selection_module.cross_fitted_influence_scores(
+        x_l,
+        y_l,
+        x_u,
+        yhat_u,
+        theta,
+        ridge_lambda,
+        damping,
+        assay_id,
+        seed,
+        purpose=purpose,
+    )
+
+    assert actual.dtype == np.float64
+    np.testing.assert_allclose(actual, expected, atol=1e-13, rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("sample_count", "assay_id", "seed", "fold_count", "purpose"),
+    [
+        (95, "ASSAY", 0, 4, "crossfit_outer_folds_v1"),
+        (96, "", 0, 4, "crossfit_outer_folds_v1"),
+        (96, "ASSAY", -1, 4, "crossfit_outer_folds_v1"),
+        (96, "ASSAY", 0, 1, "crossfit_outer_folds_v1"),
+        (96, "ASSAY", 0, 5, "crossfit_outer_folds_v1"),
+        (96, "ASSAY", 0, 4, ""),
+        (True, "ASSAY", 0, 4, "crossfit_outer_folds_v1"),
+        (96, "ASSAY", True, 4, "crossfit_outer_folds_v1"),
+    ],
+)
+def test_balanced_fold_assignment_rejects_invalid_inputs(
+    sample_count: object,
+    assay_id: object,
+    seed: object,
+    fold_count: object,
+    purpose: object,
+) -> None:
+    with pytest.raises(ValueError):
+        selection_module.balanced_fold_assignment(
+            sample_count,  # type: ignore[arg-type]
+            assay_id,  # type: ignore[arg-type]
+            seed,  # type: ignore[arg-type]
+            fold_count=fold_count,  # type: ignore[arg-type]
+            purpose=purpose,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("x_l", "y_l", "folds"),
+    [
+        (np.array([[np.nan], [1.0], [2.0], [3.0]]), np.ones(4), np.array([0, 0, 1, 1])),
+        (np.ones((4, 1)), np.array([0.0, 1.0, np.inf, 3.0]), np.array([0, 0, 1, 1])),
+        (np.ones((4, 1)), np.ones(3), np.array([0, 0, 1, 1])),
+        (np.ones((4, 1)), np.ones(4), np.array([0.0, 0.0, 1.0, 1.0])),
+        (np.ones((4, 1)), np.ones(4), np.array([0, 0, 0, 1])),
+        (np.ones((4, 1)), np.ones(4), np.array([0, 0, 2, 2])),
+    ],
+)
+def test_out_of_fold_ridge_gradient_rejects_nonfinite_or_invalid_fold_inputs(
+    x_l: FloatArray,
+    y_l: FloatArray,
+    folds: NDArray[np.generic],
+) -> None:
+    with pytest.raises(ValueError):
+        selection_module.out_of_fold_ridge_gradient(
+            x_l,
+            y_l,
+            folds,  # type: ignore[arg-type]
+            ridge_lambda=0.1,
+        )
+
+
+def test_cross_fitted_scores_reject_nonfinite_candidate_inputs() -> None:
+    x_l, y_l, x_u, yhat_u, ridge_lambda = _ridge_case()
+    theta = fit_weighted_ridge(x_l, y_l, ridge_lambda)
+    bad_yhat = yhat_u.copy()
+    bad_yhat[0] = np.nan
+
+    with pytest.raises(ValueError):
+        selection_module.cross_fitted_influence_scores(
+            x_l,
+            y_l,
+            x_u,
+            bad_yhat,
+            theta,
+            ridge_lambda,
+            damping=0.01,
+            assay_id="ASSAY",
+            seed=0,
+        )
 
 
 def test_vectorized_influence_matches_explicit_candidate_gradients_and_one_solve(
@@ -431,6 +657,32 @@ def test_selector_signatures_cannot_receive_hidden_unlabeled_or_test_labels() ->
             "yhat_u",
             "theta",
             "ridge_lambda",
+        ),
+        selection_module.balanced_fold_assignment: (
+            "sample_count",
+            "assay_id",
+            "seed",
+            "fold_count",
+            "purpose",
+        ),
+        selection_module.out_of_fold_ridge_gradient: (
+            "x_l",
+            "y_l",
+            "fold_assignment",
+            "ridge_lambda",
+        ),
+        selection_module.cross_fitted_influence_scores: (
+            "x_l",
+            "y_l",
+            "x_u",
+            "yhat_u",
+            "theta",
+            "ridge_lambda",
+            "damping",
+            "assay_id",
+            "seed",
+            "fold_count",
+            "purpose",
         ),
         stable_top_k: ("scores", "stable_hashes", "k", "largest"),
         random_indices: ("pool_size", "k", "seed"),
