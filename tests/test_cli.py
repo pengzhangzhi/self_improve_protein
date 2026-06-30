@@ -279,6 +279,23 @@ def test_show_config_exits_zero_without_dummy_subcommand() -> None:
     assert len(payload["protocol_digest"]) == 64
 
 
+def test_show_config_uses_packaged_default_outside_checkout(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "self_improve_protein.cli", "--show-config"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["event"] == "config"
+    assert payload["protocol_digest"] == (
+        "0b2a74ff76b8c7c508ceea16b004a1c128ba15704138138d49b2c153bcbfa49a"
+    )
+
+
 def test_console_usage_error_extracts_command_after_global_option_value() -> None:
     completed = subprocess.run(
         [

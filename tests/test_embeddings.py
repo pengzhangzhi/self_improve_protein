@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_type_hints
 
 import numpy as np
 import pytest
@@ -479,6 +479,39 @@ import self_improve_protein.embeddings
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_main_cli_import_does_not_require_embedding_extra() -> None:
+    code = """
+import builtins
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name == 'torch' or name.startswith('torch.'):
+        raise ModuleNotFoundError('torch intentionally unavailable')
+    if name == 'transformers' or name.startswith('transformers.'):
+        raise ModuleNotFoundError('transformers intentionally unavailable')
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+import self_improve_protein.cli
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_embedding_annotations_are_runtime_resolvable() -> None:
+    for function in (
+        mean_pool_residues,
+        embed_sequences_with_model,
+        embed_sequences,
+        get_or_create_embedding_cache,
+    ):
+        assert get_type_hints(function)
 
 
 def test_ordered_row_hash_digest_is_order_sensitive_and_strict() -> None:

@@ -1,0 +1,33 @@
+data_release: "v1.3"
+substitutions_url: "https://zenodo.org/api/records/15293562/files/DMS_ProteinGym_substitutions.zip/content"
+zero_shot_scores_url: "https://zenodo.org/api/records/15293562/files/zero_shot_substitutions_scores.zip/content"
+metadata_url: "https://zenodo.org/api/records/15293562/files/DMS_substitutions.csv/content"
+proteingym_upstream_commit: "1f8de974dead8ff7501eff087b725d14a965e9f9"
+substitutions_sha256: "3a83766254ac9ac9984ec25cb73c6e010ea4418f5e35f143933e6b6e6473b921"
+zero_shot_scores_sha256: "3fd7cdb5e78f1d43cabfabfeb6578c252b63af23ba2ab44db0094dc3a42de36d"
+metadata_sha256: "a8f498011532a74aa9fe556a50555a75e928c5837d19c06a87592ae04049b308"
+teacher_column: "ESM1v_ensemble"
+model: "facebook/esm2_t12_35M_UR50D"
+model_revision: "6fbf070e65b0b7291e7bbcd451118c216cff79d8"
+
+working_size: 6000
+n_labeled: 96
+n_unlabeled: 2000
+n_test: 1000
+q: 192
+
+pseudo_weight: 0.1
+ridge_lambda: 0.01
+damping: 0.0001
+
+seeds: [0, 1, 2, 3, 4]
+assay_count: 8
+max_length: 512
+
+preprocessing:
+  feature_scaling: "scalar_rms"
+  student_fit: "no_intercept"
+  label_ddof: 0
+
+analysis_seed: 20260629
+random_diagnostic_replicates: 100

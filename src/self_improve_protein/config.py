@@ -1,7 +1,7 @@
 """Validated, immutable experiment protocol loading."""
 
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self
 
 import yaml
 from pydantic import (
@@ -11,6 +11,10 @@ from pydantic import (
     StrictInt,
     StringConstraints,
     model_validator,
+)
+
+DEFAULT_CONFIG_PATH: Final = (
+    Path(__file__).resolve().parent / "resources" / "v0.yaml"
 )
 
 GitCommit = Annotated[

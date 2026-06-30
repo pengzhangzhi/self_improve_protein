@@ -1,0 +1,7 @@
+study,phase,comparison,metric,gain_definition,mean_gain,se,task_wins,task_total,assay_wins,assay_total,exact_sign_flip_pvalue,q,pseudo_weight,promoted,aggregate_sha256
+v0,confirmatory,ours_full_hessian_vs_random,spearman,ours_minus_random,-0.055261339,0.008648614,5,40,0,8,0.0078125,192,0.1,false,d9426a88554f6e84d9a2b6995a4aa319f9c756570f8df4b22240136e885fabe3
+crossfit,exploratory,crossfit_vs_random,spearman,crossfit_minus_random,-0.055370302,0.006965874,2,40,0,8,0.0078125,192,0.1,false,5cb8ca71bd2540e32ca467d4de233ec0727572f48ffbcaa62c8a3a3e3e1b88fc
+locality,exploratory,full_hessian_vs_random,spearman,full_hessian_minus_random,-0.010669757,0.001723420,11,40,0,8,0.0078125,24,0.01,false,917ac35d9ef2e9f885c1b774cb590e231056e35e97d43a579e0f362372ec97cf
+locality,exploratory,crossfit_vs_random,spearman,crossfit_minus_random,-0.007866223,0.002943007,11,40,1,8,0.0390625,24,0.01,false,917ac35d9ef2e9f885c1b774cb590e231056e35e97d43a579e0f362372ec97cf
+exact_cv,exploratory,exact_cv_vs_random,mse,random_minus_exact_cv,-0.432049477,0.102680530,2,40,0,8,0.0078125,192,0.1,false,5c415a12513f8f9d47aaeb75d79529f2aa720bbeb55e94750fec8d03a6d1759d
+exact_cv,exploratory,exact_cv_vs_random,spearman,exact_cv_minus_random,-0.046352265,0.013880187,6,40,1,8,0.015625,192,0.1,false,5c415a12513f8f9d47aaeb75d79529f2aa720bbeb55e94750fec8d03a6d1759d

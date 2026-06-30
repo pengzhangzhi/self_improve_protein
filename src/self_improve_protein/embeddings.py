@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated, Any, Final, Literal, Self, cast
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Self, cast
 
 import numpy as np
-import torch
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -25,6 +25,13 @@ from pydantic import (
 
 from self_improve_protein.provenance import atomic_write_json, sha256_file
 
+if TYPE_CHECKING:
+    from torch import Tensor as TorchTensor
+    from torch import device as TorchDevice
+else:
+    TorchTensor = Any
+    TorchDevice = Any
+
 DEFAULT_MODEL_ID: Final = "facebook/esm2_t12_35M_UR50D"
 DEFAULT_MODEL_REVISION: Final = "6fbf070e65b0b7291e7bbcd451118c216cff79d8"
 POOLING_DEFINITION: Final[
@@ -33,15 +40,6 @@ POOLING_DEFINITION: Final[
 
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
-_INTEGER_MASK_DTYPES = {
-    torch.uint8,
-    torch.int8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-    torch.bool,
-}
-
 Sha256Hex = Annotated[
     str,
     StringConstraints(strict=True, pattern=_SHA256_PATTERN),
@@ -94,25 +92,47 @@ class EmbeddingCacheMetadata(_FrozenCacheModel):
         return self
 
 
-def _require_tensor(value: object, name: str) -> torch.Tensor:
-    if not isinstance(value, torch.Tensor):
+def _require_torch_module() -> Any:
+    """Load the optional embedding dependency only on tensor code paths."""
+    try:
+        return importlib.import_module("torch")
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError(
+            "ESM-2 embedding requires the optional 'embed' dependencies; "
+            "install self-improve-protein[embed]"
+        ) from error
+
+
+def _require_tensor(value: object, name: str) -> TorchTensor:
+    torch_module = _require_torch_module()
+    if not isinstance(value, torch_module.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
-    return value
+    return cast(TorchTensor, value)
 
 
-def _validate_mask(mask: torch.Tensor, name: str) -> None:
-    if mask.dtype not in _INTEGER_MASK_DTYPES:
+def _validate_mask(mask: TorchTensor, name: str) -> None:
+    torch_module = _require_torch_module()
+    integer_mask_dtypes = {
+        torch_module.uint8,
+        torch_module.int8,
+        torch_module.int16,
+        torch_module.int32,
+        torch_module.int64,
+        torch_module.bool,
+    }
+    if mask.dtype not in integer_mask_dtypes:
         raise TypeError(f"{name} mask must have boolean or integer dtype")
-    if not bool(torch.all((mask == 0) | (mask == 1)).item()):
+    if not bool(torch_module.all((mask == 0) | (mask == 1)).item()):
         raise ValueError(f"{name} mask values must be zero or one")
 
 
 def mean_pool_residues(
-    last_hidden_state: torch.Tensor,
-    attention_mask: torch.Tensor,
-    special_tokens_mask: torch.Tensor,
-) -> torch.Tensor:
+    last_hidden_state: TorchTensor,
+    attention_mask: TorchTensor,
+    special_tokens_mask: TorchTensor,
+) -> TorchTensor:
     """Mean-pool finite last-layer states over attended non-special tokens."""
+    torch_module = _require_torch_module()
     hidden = _require_tensor(last_hidden_state, "last_hidden_state")
     attention = _require_tensor(attention_mask, "attention_mask")
     special = _require_tensor(special_tokens_mask, "special_tokens_mask")
@@ -131,19 +151,19 @@ def mean_pool_residues(
         raise TypeError("last_hidden_state must have a floating dtype")
     _validate_mask(attention, "attention")
     _validate_mask(special, "special_tokens")
-    if not bool(torch.isfinite(hidden).all().item()):
+    if not bool(torch_module.isfinite(hidden).all().item()):
         raise ValueError("last_hidden_state contains non-finite values")
 
-    residue_mask = attention.to(torch.bool) & ~special.to(torch.bool)
+    residue_mask = attention.to(torch_module.bool) & ~special.to(torch_module.bool)
     residue_counts = residue_mask.sum(dim=1)
     if bool((residue_counts == 0).any().item()):
         raise ValueError("each sequence must contain at least one; zero residue row")
-    hidden_float = hidden.to(torch.float32)
+    hidden_float = hidden.to(torch_module.float32)
     pooled = (hidden_float * residue_mask.unsqueeze(-1)).sum(dim=1)
-    pooled = pooled / residue_counts.to(torch.float32).unsqueeze(-1)
-    if not bool(torch.isfinite(pooled).all().item()):
+    pooled = pooled / residue_counts.to(torch_module.float32).unsqueeze(-1)
+    if not bool(torch_module.isfinite(pooled).all().item()):
         raise ValueError("mean-pooled embeddings contain non-finite values")
-    return pooled.to(torch.float32)
+    return pooled.to(torch_module.float32)
 
 
 def _validate_sequences(sequences: Sequence[str]) -> tuple[str, ...]:
@@ -165,7 +185,8 @@ def _validate_batch_size(batch_size: int) -> int:
     return batch_size
 
 
-def _tokenize_batch(tokenizer: Any, batch: tuple[str, ...]) -> dict[str, torch.Tensor]:
+def _tokenize_batch(tokenizer: Any, batch: tuple[str, ...]) -> dict[str, TorchTensor]:
+    torch_module = _require_torch_module()
     encoded = tokenizer(
         batch,
         add_special_tokens=True,
@@ -181,11 +202,11 @@ def _tokenize_batch(tokenizer: Any, batch: tuple[str, ...]) -> dict[str, torch.T
     if not required.issubset(encoded):
         missing = ", ".join(sorted(required.difference(encoded)))
         raise ValueError(f"tokenizer output is missing required tensors: {missing}")
-    tensors: dict[str, torch.Tensor] = {}
+    tensors: dict[str, TorchTensor] = {}
     for key, value in encoded.items():
-        if not isinstance(key, str) or not isinstance(value, torch.Tensor):
+        if not isinstance(key, str) or not isinstance(value, torch_module.Tensor):
             raise TypeError("tokenizer output must map strings to tensors")
-        tensors[key] = value
+        tensors[key] = cast(TorchTensor, value)
     return tensors
 
 
@@ -195,12 +216,13 @@ def embed_sequences_with_model(
     tokenizer: Any,
     model: Any,
     batch_size: int,
-    device: str | torch.device,
+    device: str | TorchDevice,
 ) -> np.ndarray:
     """Embed sequences in exact input order using already-loaded components."""
+    torch_module = _require_torch_module()
     ordered_sequences = _validate_sequences(sequences)
     checked_batch_size = _validate_batch_size(batch_size)
-    checked_device = torch.device(device)
+    checked_device = torch_module.device(device)
     model = model.to(checked_device)
     model = model.eval()
     batches: list[np.ndarray] = []
@@ -214,12 +236,12 @@ def embed_sequences_with_model(
         }
         attention = model_inputs["attention_mask"]
         with (
-            torch.inference_mode(),
-            torch.autocast(device_type=checked_device.type, enabled=False),
+            torch_module.inference_mode(),
+            torch_module.autocast(device_type=checked_device.type, enabled=False),
         ):
             output = model(**model_inputs, return_dict=True)
             hidden = getattr(output, "last_hidden_state", None)
-            if not isinstance(hidden, torch.Tensor):
+            if not isinstance(hidden, torch_module.Tensor):
                 raise TypeError("model output must contain tensor last_hidden_state")
             pooled = mean_pool_residues(hidden, attention, special)
         if pooled.shape[0] != len(batch):
@@ -239,14 +261,15 @@ def embed_sequences_with_model(
 
 def _validate_float32_model_state(model: Any) -> None:
     """Reject floating model state that would change embedding cache bytes."""
+    torch_module = _require_torch_module()
     for state_kind, values in (
         ("parameter", model.named_parameters()),
         ("buffer", model.named_buffers()),
     ):
         for name, value in values:
-            if not isinstance(name, str) or not isinstance(value, torch.Tensor):
+            if not isinstance(name, str) or not isinstance(value, torch_module.Tensor):
                 raise TypeError(f"model {state_kind} entries must be named tensors")
-            if value.is_floating_point() and value.dtype != torch.float32:
+            if value.is_floating_point() and value.dtype != torch_module.float32:
                 raise ValueError(
                     f"model {state_kind} {name!r} must have dtype float32"
                 )
@@ -254,6 +277,7 @@ def _validate_float32_model_state(model: Any) -> None:
 
 def _load_hf_components(model_id: str, model_revision: str) -> tuple[Any, Any]:
     """Load one explicit revision in float32 only on the real command path."""
+    torch_module = _require_torch_module()
     from transformers import AutoModel, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call]
@@ -264,7 +288,7 @@ def _load_hf_components(model_id: str, model_revision: str) -> tuple[Any, Any]:
         model_id,
         revision=model_revision,
         add_pooling_layer=False,
-        dtype=torch.float32,
+        dtype=torch_module.float32,
     )
     _validate_float32_model_state(model)
     return tokenizer, model
@@ -276,7 +300,7 @@ def embed_sequences(
     model_id: str,
     model_revision: str,
     batch_size: int,
-    device: str | torch.device,
+    device: str | TorchDevice,
 ) -> np.ndarray:
     """Embed sequences with one explicit revision-pinned representation."""
     tokenizer, model = _load_hf_components(model_id, model_revision)
@@ -586,7 +610,7 @@ def get_or_create_embedding_cache(
     expected_embedding_dim: int,
     sequences: Sequence[str],
     batch_size: int,
-    device: str | torch.device,
+    device: str | TorchDevice,
 ) -> np.ndarray:
     """Create one identity-coupled cache under a cross-process writer lock."""
     array_path = Path(npy_path)

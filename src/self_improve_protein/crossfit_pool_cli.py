@@ -20,7 +20,7 @@ from self_improve_protein.cli import (
     _write_json_once,
     _write_parquet_once,
 )
-from self_improve_protein.config import Protocol, load_protocol
+from self_improve_protein.config import DEFAULT_CONFIG_PATH, Protocol, load_protocol
 from self_improve_protein.crossfit_data import (
     CrossfitPoolManifest,
     build_crossfit_pool,
@@ -56,7 +56,7 @@ def main(
     config: Annotated[
         Path,
         typer.Option("--config", help="Validated protocol YAML for every stage."),
-    ] = Path("configs/v0.yaml"),
+    ] = DEFAULT_CONFIG_PATH,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Render the exact plan without writes."),

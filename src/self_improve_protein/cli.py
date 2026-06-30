@@ -28,7 +28,7 @@ from self_improve_protein.analysis import (
     validate_result_table,
     validate_v0_result_table,
 )
-from self_improve_protein.config import Protocol, load_protocol
+from self_improve_protein.config import DEFAULT_CONFIG_PATH, Protocol, load_protocol
 from self_improve_protein.data import (
     AssayEligibility,
     DataManifest,
@@ -174,7 +174,7 @@ def main(
             "--config",
             help="Validated protocol YAML used by every stage.",
         ),
-    ] = Path("configs/v0.yaml"),
+    ] = DEFAULT_CONFIG_PATH,
     dry_run: Annotated[
         bool,
         typer.Option(

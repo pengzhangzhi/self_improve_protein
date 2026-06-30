@@ -41,10 +41,16 @@ so 26 untouched assay outcomes remain sealed.
 
 Detailed, hash-bound decisions are tracked in:
 
+- [`docs/results/overall-conclusion.md`](docs/results/overall-conclusion.md)
 - [`docs/results/v0-decision.md`](docs/results/v0-decision.md)
 - [`docs/results/crossfit-decision.md`](docs/results/crossfit-decision.md)
 - [`docs/results/locality-decision.md`](docs/results/locality-decision.md)
 - [`docs/results/exact-cv-decision.md`](docs/results/exact-cv-decision.md)
+
+Compact public result tables are available in
+[`results/v0-method-means.csv`](results/v0-method-means.csv) and
+[`results/branch-effects.csv`](results/branch-effects.csv). The large raw
+datasets, embeddings, and task artifacts are deliberately excluded from Git.
 
 These findings apply to the frozen ProteinGym/ESM1v/ESM-2-ridge setup. They do
 not establish that pseudo-label selection is impossible in other protein
@@ -60,10 +66,27 @@ fitness regimes. The theory-to-experiment limitations are recorded in
 ## Development
 
 Python 3.11 or newer is required. Reproduce the executable development
-environment with `uv sync --frozen --extra dev`, then run `uv run pytest`,
-`uv run ruff check .`, and `uv run mypy src`. The tracked lockfile pins NumPy
-2.3.5 to freeze the `PCG64`/`Generator.choice` behavior used by the random
-selection baseline. As a local fallback, install with `pip install -e '.[dev]'`.
+environment with `uv sync --frozen --extra dev --extra embed`, then run
+`uv run pytest`, `uv run ruff check .`, and `uv run mypy src`. The tracked
+lockfile pins NumPy 2.3.5 to freeze the `PCG64`/`Generator.choice` behavior used
+by the random selection baseline. As a local fallback, install with
+`pip install -e '.[dev,embed]'`. Importing the CLI and inspecting its bundled
+protocol do not require the embedding stack; install the `embed` extra before
+running `embed-assay`.
+
+For a first inspection:
+
+```bash
+uv sync --frozen --extra dev --extra embed
+uv run self-improve-protein --show-config
+uv run self-improve-protein --help
+```
+
+The main CLI exposes the pinned data preparation, ESM-2 embedding, task,
+aggregation, and exact-rebuild verification stages. `slurm/submit_pipeline.sh`
+submits the dependency-ordered cluster pipeline after its documented `SI_*`
+environment variables are set. The exploratory CLIs are available as Python
+modules, for example `python -m self_improve_protein.exact_cv_cli --help`.
 
 The MIT license covers this repository's code. ProteinGym data and ESM model
 artifacts remain governed by their upstream terms and are not redistributed

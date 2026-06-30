@@ -31,7 +31,7 @@ from self_improve_protein.cli import (
 from self_improve_protein.cli import (
     load_evaluation_labels as load_evaluation_labels,
 )
-from self_improve_protein.config import Protocol, load_protocol
+from self_improve_protein.config import DEFAULT_CONFIG_PATH, Protocol, load_protocol
 from self_improve_protein.crossfit_cli import (
     _load_manifests as _load_manifests,
 )
@@ -99,7 +99,7 @@ class _RuntimeOptions:
 @app.callback()
 def main(
     context: typer.Context,
-    config: Annotated[Path, typer.Option("--config")] = Path("configs/v0.yaml"),
+    config: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     """Set the frozen protocol and mutation policy."""

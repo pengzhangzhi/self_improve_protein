@@ -31,7 +31,7 @@ from self_improve_protein.cli import (
     _write_json_once,
     load_evaluation_labels,
 )
-from self_improve_protein.config import Protocol, load_protocol
+from self_improve_protein.config import DEFAULT_CONFIG_PATH, Protocol, load_protocol
 from self_improve_protein.crossfit import (
     CARD_ID,
     CARD_SHA,
@@ -99,7 +99,7 @@ class ReplicationContext:
 @app.callback()
 def main(
     context: typer.Context,
-    config: Annotated[Path, typer.Option("--config")] = Path("configs/v0.yaml"),
+    config: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     """Set the frozen protocol and dry-run policy."""

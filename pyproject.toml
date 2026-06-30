@@ -28,6 +28,10 @@ dependencies = [
 [project.scripts]
 self-improve-protein = "self_improve_protein.cli:cli_main"
 
+[project.urls]
+Repository = "https://github.com/pengzhangzhi/self_improve_protein"
+Issues = "https://github.com/pengzhangzhi/self_improve_protein/issues"
+
 [project.optional-dependencies]
 embed = [
     "torch==2.10.0",
@@ -45,6 +49,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+self_improve_protein = ["resources/*.yaml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

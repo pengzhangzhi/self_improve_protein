@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -102,7 +103,7 @@ def _mock_submit_environment(
     repo = tmp_path / "repo"
     python_path = repo / ".venv" / "bin" / "python"
     python_path.parent.mkdir(parents=True)
-    active_python = (Path(".venv") / "bin" / "python").absolute()
+    active_python = Path(sys.executable).absolute()
     python_path.write_text(
         f'#!/usr/bin/env bash\nexec "{active_python}" "$@"\n',
         encoding="utf-8",
@@ -259,9 +260,10 @@ def test_confirmatory_submit_validates_bound_pilot_root_not_output_root(
     }
     gate.write_text(json.dumps(gate_payload), encoding="utf-8")
     validator = repo / ".venv" / "bin" / "self-improve-protein"
+    active_python = Path(sys.executable).absolute()
     source_root = (Path.cwd() / "src").absolute()
     validator.write_text(
-        "#!/usr/bin/env python3\n"
+        f"#!{active_python}\n"
         "import json\n"
         "import sys\n"
         "from pathlib import Path\n"

@@ -4,9 +4,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from self_improve_protein.config import Protocol, load_protocol
+from self_improve_protein.config import DEFAULT_CONFIG_PATH, Protocol, load_protocol
 
 CONFIG_PATH = Path("configs/v0.yaml")
+
+
+def test_packaged_default_protocol_matches_locked_checkout_config() -> None:
+    assert DEFAULT_CONFIG_PATH.read_bytes() == CONFIG_PATH.read_bytes()
 
 
 def _protocol_data() -> dict[str, object]:

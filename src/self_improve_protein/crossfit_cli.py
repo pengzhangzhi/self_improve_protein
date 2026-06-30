@@ -31,7 +31,7 @@ from self_improve_protein.cli import (
     _write_json_once,
     load_evaluation_labels,
 )
-from self_improve_protein.config import Protocol, load_protocol
+from self_improve_protein.config import DEFAULT_CONFIG_PATH, Protocol, load_protocol
 from self_improve_protein.crossfit import (
     CARD_ID,
     CARD_SHA,
@@ -91,7 +91,7 @@ def main(
     config: Annotated[
         Path,
         typer.Option("--config", help="Validated frozen v0 protocol YAML."),
-    ] = Path("configs/v0.yaml"),
+    ] = DEFAULT_CONFIG_PATH,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Plan without writing artifacts."),
