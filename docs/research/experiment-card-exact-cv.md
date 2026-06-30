@@ -123,7 +123,7 @@ refitting from scratch:
 {1+w x_{j,k}^{\top}A_{k,r}^{-1}x_{j,k}}.
 \]
 
-Its selection criterion is the mean validation MSE of
+Its selection criterion is the mean **unhalved** validation MSE of
 \(\theta_{k,r+1}^{(j)}\) over the four 24-example folds. After selecting the
 best candidate, update the inverse exactly by Sherman--Morrison:
 
@@ -138,8 +138,9 @@ A_{k,r}^{-1}
 
 Direct-solve parity checks on synthetic and real-shape hidden-label-free inputs
 must pass before an official task is allowed to run. The implementation must
-also verify finite positive Sherman--Morrison denominators and reconstruct the
-final four states from the frozen ordering.
+also verify finite Sherman--Morrison denominators greater than or equal to one
+up to declared numerical tolerance, and reconstruct the final four states from
+the frozen ordering.
 
 ## Final model and baseline
 
@@ -212,6 +213,12 @@ prefixes
 ```text
 q_prefix in {24, 48, 72, 96, 192}.
 ```
+
+Each descriptive prefix is refit with the actual normalized deployed objective
+for that prefix, using denominator \(96+wq_{\mathrm{prefix}}\). The fixed
+endpoint denominator \(96+w192\) is used only for the 192-point deployed fit;
+the fold-level greedy surrogate retains its separately frozen
+\(D=72+w192\) at every selection step.
 
 After unblinding, report their fold-CV MSE trajectory, test MSE and Spearman,
 marginal validation gains, selected pseudo-label error, and overlap with the
