@@ -61,10 +61,14 @@ is `19.2 / 115.2 = 1/6`.
 
 The model pipeline has four stages:
 
-1. **Representation.** ESM-2, a pretrained protein language model, converts
-   each sequence into a 480-number **embedding** by averaging its residue
-   representations. “Frozen” means the ESM-2 parameters are not trained here;
-   embeddings are fixed inputs.
+1. **Representation and preprocessing.** ESM-2, a pretrained protein language
+   model, converts each sequence into a 480-number **embedding** by averaging
+   its residue representations. “Frozen” means the ESM-2 parameters are not
+   trained here. The raw cached embeddings enter as `FitInputs.x_l`,
+   `FitInputs.x_u`, and `FitInputs.x_test`. Means and one scalar
+   root-mean-square (RMS) scale are fitted on the 96 labeled embeddings only,
+   then applied to all three splits. Ridge fitting, gradients, Hessians, and
+   predictions use these transformed matrices.
 2. **External teacher.** ProteinGym's `ESM1v_ensemble` predicts mutation effects
    from sequence without fitting to this assay, often called a *zero-shot*
    score. A slope and intercept fitted on the 96 labels align those scores to
@@ -87,7 +91,8 @@ chosen:
 | Top teacher | Select the 192 largest calibrated teacher predictions |
 | Full influence | Select the 192 largest paper-inspired influence scores |
 
-A separately carded exploratory **no-Hessian** ablation replaces inverse-Hessian
+A separately carded exploratory [**no-Hessian**
+ablation](research/experiment-card-no-hessian.md) replaces inverse-Hessian
 geometry with the identity. All pseudo-label methods otherwise share the same
 teacher labels, count, weight, preprocessing, student, and test set.
 
@@ -95,12 +100,12 @@ teacher labels, count, weight, preprocessing, student, and test set.
 
 | Symbol | Meaning | Protein instantiation / code object |
 | --- | --- | --- |
-| `X` | Input features | ESM-2 embedding matrices such as `FitInputs.x_l`, `x_u`, and `x_test` |
+| `X` | Input features | Labeled-only centered, scalar-RMS-scaled ESM-2 matrices. `FitInputs.x_*` hold raw embeddings; `experiment.py` creates the transformed local `x_l`, `x_u`, and `x_test` used by ridge. |
 | `Y` | Measured response | Assay-specific DMS scores; labeled values are standardized and hidden values are isolated in `EvaluationLabels` |
 | `D^L` | Labeled dataset | The 96 embedding/score pairs passed to the student |
 | `D^U` | Unlabeled dataset | The 2,000 candidate embeddings and external-teacher predictions, without true candidate scores |
-| `f_theta` | Student prediction function | Linear prediction `x @ theta` from the ridge coefficients |
-| `H` | Local curvature of labeled ridge loss | `X_L.T @ X_L / n + lambda I` in `selection.py`; scoring also adds damping `rho I` |
+| `f_theta` | Student prediction function | Linear prediction `x @ theta` using a transformed embedding `x` and the ridge coefficients |
+| `H` | Local curvature of labeled ridge loss | `x_l.T @ x_l / n + lambda I` from the transformed labeled matrix; scoring also adds damping `rho I` |
 | `g_L` | Labeled loss gradient | Mean unregularized residual gradient at the supervised ridge fit |
 | `g_j` | Candidate pseudo-gradient | Candidate residual times its embedding, using the calibrated external pseudo-label |
 | `S_j` | Candidate selection score | `g_L.T @ inv(H + rho I) @ (g_j - g_L)`; larger values rank first |
@@ -126,9 +131,9 @@ self pseudo-label = current student prediction
 
 With ridge regularization, the shared score is a non-positive constant; without
 regularization it is zero. This is an algebraic property, not a software issue.
-V0 therefore substitutes a pretrained ESM-1v model external to the ridge
-student; its assay calibration still uses the same 96 labels. Its pseudo-label
-generally differs from the current ridge prediction. V0 tests an
+V0 therefore uses ProteinGym's `ESM1v_ensemble` score as an external teacher;
+its assay calibration still uses the same 96 labels. Its pseudo-label generally
+differs from the current ridge prediction. V0 tests an
 **external-teacher influence heuristic**, not literal self-teaching and not a
 direct empirical proof of the manuscript theorem.
 
@@ -151,14 +156,20 @@ it is not an impossibility theorem for pseudo-label selection.
 Each later study was a predeclared diagnosis on already exposed assays. None
 replaces the locked v0 comparison. “Exact-CV” below means exact
 cross-validation: repeatedly fitting on part of the labeled data and scoring
-candidates on the held-out part.
+candidates on the fold-held-out labeled part. Those fold labels are validation
+data: they are deliberately reused across adaptive selection steps, not confused
+with the sealed 1,000-variant test outcomes used only after fitting is frozen.
 
 | Study | Question | Answer |
 | --- | --- | --- |
 | **v0** | Does full influence ranking beat random when labels and retraining are fixed? | No. The full selector lost on the primary paired comparison. |
 | **Crossfit** | Is the in-sample outer gradient the problem? | Replacing it with a four-fold out-of-fold gradient did not improve selection. |
-| **Locality** | Is the 192-point, weight-0.1 update too large for a first-order score? | Smaller updates made the parameter approximation much more faithful, but influence selection still did not beat random in any tested cell. |
+| **Locality** | Is the 192-point, weight-0.1 update too large for a first-order score? | Smaller updates made the parameter approximation more faithful, but full-Hessian and cross-fitted influence each failed to beat random in all 15 cells. |
 | **Exact-CV** | Does exact greedy held-out-loss lookahead work after removing the Hessian and Taylor approximations? | It fit the reused validation folds strongly but generalized worse than random. |
+
+The no-Hessian ablation had one descriptive positive Spearman cell in the
+locality grid (`q=72`, `w=0.1`; `p=0.6172`), but its MSE was worse than random
+in all 15 cells. No selector established superiority to random.
 
 The reviewed v0 mean Spearman values were:
 
@@ -167,9 +178,12 @@ The reviewed v0 mean Spearman values were:
 | `0.29309` | `0.34971` | `0.29445` |
 
 Full influence minus random was `-0.05526` Spearman and won **0/8 assay
-means**. Random's improvement over supervised shows that the calibrated
-external teacher contains useful signal. Full influence's result shows that
-this selector did not extract it better than a random subset.
+means**. Random's improvement over supervised is consistent with useful signal
+in the calibrated external teacher, but it is partly confounded by the changed
+loss-to-penalty balance (effective regularization) in pseudo-labeled retraining.
+The full-influence-versus-random contrast holds pseudo-labels, count, weight, and
+retraining objective fixed, so it is the clean selection test—and the full
+selector lost it.
 
 Exact-CV reinforced the distinction between finding an attractive selection
 surrogate and improving hidden outcomes. Its test MSE was `1.6177`, versus
@@ -192,7 +206,7 @@ Read by scientific responsibility rather than alphabetical filename:
 | Frozen protocol | [`configs/v0.yaml`](../configs/v0.yaml), [`config.py`](../src/self_improve_protein/config.py) | You need the exact data, model, split, and hyperparameter values | YAML, Pydantic |
 | Data cohort and splits | [`data.py`](../src/self_improve_protein/data.py) | You need to understand joins, eligibility, row hashes, manifests, or disjoint splits | Protocol, ProteinGym archives |
 | Sequence representation | [`embeddings.py`](../src/self_improve_protein/embeddings.py) | You need ESM-2 residue pooling, GPU inference, or validated caches | Torch, Transformers, source hashes |
-| Teacher and student math | [`ridge.py`](../src/self_improve_protein/ridge.py) | You need feature/label transforms, ESM-1v calibration, ridge fitting, gradients, or Hessians | NumPy |
+| Teacher and student math | [`ridge.py`](../src/self_improve_protein/ridge.py) | You need feature/label transforms, `ESM1v_ensemble` calibration, ridge fitting, gradients, or Hessians | NumPy |
 | Candidate rules | [`selection.py`](../src/self_improve_protein/selection.py) | You need random, top-teacher, full, no-Hessian, or crossfit scoring and tie-breaking | Ridge utilities, deterministic seeds |
 | End-to-end task | [`experiment.py`](../src/self_improve_protein/experiment.py) | You need to trace one fit, the hidden-label boundary, refitting, diagnostics, and evaluation | Config, ridge, selection, metrics, provenance |
 | Metric definitions | [`metrics.py`](../src/self_improve_protein/metrics.py) | You need exact Spearman, MSE, or NDCG@10% behavior | NumPy, SciPy |
@@ -200,7 +214,7 @@ Read by scientific responsibility rather than alphabetical filename:
 | Exploratory diagnoses | [`crossfit.py`](../src/self_improve_protein/crossfit.py), [`locality.py`](../src/self_improve_protein/locality.py), [`exact_cv.py`](../src/self_improve_protein/exact_cv.py) | You need the later mechanism screens after understanding v0 | Frozen v0 objects plus branch-specific cards |
 | Executable checks | [`tests/`](../tests/), [`verify_r1_r3.sh`](../scripts/verify_r1_r3.sh) | You change code or want evidence for algebra, leakage safety, determinism, and CLI contracts | Small fixtures; no full study rerun |
 | Cluster orchestration | [`slurm/`](../slurm/), especially [`submit_pipeline.sh`](../slurm/submit_pipeline.sh) | You have approved data/GPU storage and are reproducing a card | Slurm, site variables, synced environment, raw artifacts |
-| Experiment cards | [`experiment-card-v0.md`](research/experiment-card-v0.md), [`crossfit`](research/experiment-card-crossfit.md), [`locality`](research/experiment-card-locality.md), [`exact-CV`](research/experiment-card-exact-cv.md) | Before reading or changing an experiment implementation | Scientific question and frozen protocol |
+| Experiment cards | [`v0`](research/experiment-card-v0.md), [`no-Hessian`](research/experiment-card-no-hessian.md), [`crossfit`](research/experiment-card-crossfit.md), [`locality`](research/experiment-card-locality.md), [`exact-CV`](research/experiment-card-exact-cv.md) | Before reading or changing an experiment implementation | Scientific question and frozen protocol |
 | Decision memos | [`overall-conclusion.md`](results/overall-conclusion.md) and [`docs/results/`](results/) | You need reviewed outcomes rather than implementation detail | Aggregated, provenance-checked artifacts |
 
 ## Local setup
@@ -237,7 +251,11 @@ The launcher requires site-specific variables such as `SI_ACCOUNT`,
 `SI_CPU_PARTITION`, `SI_GPU_PARTITION`, `SI_REPO_ROOT`, `SI_DATA_ROOT`,
 `SI_ARTIFACT_ROOT`, and `SI_SLURM_CONF`. Set them in a private local profile;
 never publish cluster paths, credentials, or raw-data locations in the
-repository.
+repository. `submit_pipeline.sh` defaults to `SI_MODE=development`, which
+schedules two assay-seed tasks rather than the full task grid. Reproducing the
+full eight-assay by five-seed, 40-task study requires `SI_MODE=confirmatory` and
+a validated `SI_R5_GATE`; the launcher verifies that gate before it submits
+confirmatory tasks.
 
 ## Extending the study safely
 
@@ -276,7 +294,7 @@ Use this sequence for a new selector or research question:
 | DMS | Deep mutational scanning: measuring many sequence variants in parallel |
 | Variant | A protein sequence that differs from the assay reference |
 | Embedding | A fixed numeric representation of a sequence |
-| Teacher | ESM-1v, whose calibrated prediction supplies pseudo-labels |
+| Teacher | ProteinGym's `ESM1v_ensemble` score, affine-calibrated to supply pseudo-labels |
 | Pseudo-label | A model prediction treated as a weighted training target |
 | Student | The ridge regressor trained on ESM-2 embeddings |
 | Hessian | Matrix describing local curvature of the fitted objective |
@@ -289,5 +307,5 @@ Use this sequence for a new selector or research question:
 1. [Frozen v0 configuration](../configs/v0.yaml)
 2. [Theory-to-experiment audit](research/theory-audit.md)
 3. [Overall scientific conclusion](results/overall-conclusion.md)
-4. Experiment cards: [v0](research/experiment-card-v0.md), [crossfit](research/experiment-card-crossfit.md), [locality](research/experiment-card-locality.md), and [exact-CV](research/experiment-card-exact-cv.md)
+4. Experiment cards: [v0](research/experiment-card-v0.md), [no-Hessian](research/experiment-card-no-hessian.md), [crossfit](research/experiment-card-crossfit.md), [locality](research/experiment-card-locality.md), and [exact-CV](research/experiment-card-exact-cv.md)
 5. Compact reviewed tables: [v0 method means](../results/v0-method-means.csv) and [branch effects](../results/branch-effects.csv)
