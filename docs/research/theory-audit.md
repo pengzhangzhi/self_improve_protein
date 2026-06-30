@@ -65,6 +65,12 @@ S_j^{\mathrm{CF}}
 The two gradient roles must remain distinct; replacing both occurrences by a
 validation gradient would not be the derivative of the fitted objective.
 
+The preregistered cross-fit repair intentionally keeps the 96-label
+standardization and teacher calibration fixed to preserve all other v0
+coordinates. Consequently, each held-out fold still affects its own global
+label transform and calibrated teacher. It is a single-change diagnostic, not
+a fully outcome-held-out risk estimator.
+
 ### The advertised asymptotic window is insufficient
 
 Let \(q=mk\) and, for small perturbations, \(t\asymp wq/n\). For the displayed
@@ -96,6 +102,16 @@ gate only on tasks with at least \(q\) positive scores. The manuscript also
 defines later pseudo-labels using the current student while its displayed score
 is anchored to the raw fit and Hessian; a genuine iterative derivative should
 use the current accumulated objective and state its treatment of frozen labels.
+
+The cross-fit diagnostic named predicted outer-loss change uses the cross-fit
+gradient, whereas its recorded realized labeled-loss change is evaluated on the
+in-sample labeled objective. These are different outer functionals and should
+not be interpreted as a direct sign-agreement test.
+
+Finally, the theorem concerns squared population risk while the experiment's
+primary endpoint is Spearman rank correlation. Test MSE is the closer empirical
+analogue; Spearman tests the protein-ranking application rather than the
+displayed risk expansion.
 
 ## Proof details requiring repair
 
