@@ -1,93 +1,151 @@
 # self-improve-protein
 
-This repository implements a predeclared study of influence-ranked,
-external-teacher pseudo-label selection for low-label protein fitness
-regression. The study uses the substitution assays from
-[ProteinGym v1.3](https://zenodo.org/records/15293562) and frozen
-[`facebook/esm2_t12_35M_UR50D`](https://huggingface.co/facebook/esm2_t12_35M_UR50D)
-representations. The literal protocol is tracked in `configs/v0.yaml`.
+This project asks a practical question: when laboratory measurements are
+scarce, can a score choose model-generated labels that help predict protein
+fitness? A protein variant is a sequence with one or more amino-acid changes,
+and its fitness here is the value measured by one particular laboratory assay.
+A model-generated training target is called a **pseudo-label**.
 
-## Claim boundary
+We tested several ways to select the same number of pseudo-labels for a small
+prediction model. The software and predeclared study ran correctly, but the
+scientific answer was negative: the proposed influence-based selector did not
+beat choosing candidates at random.
 
-The confirmatory question is deliberately narrow: when every pseudo-labeling
-method receives the same calibrated external `ESM1v_ensemble` teacher scores,
-does influence ranking select a fixed-size pseudo-labeled subset that improves
-held-out ProteinGym ranking relative to random selection? A positive result
-would support that empirical external-teacher selection rule only. It would not
-validate a literal self-teacher algorithm, establish the paper's asymptotic
-proof, or show that pseudo-labeling generally improves protein models.
+> **Start here:** If protein biology or research code is new to you, read
+> [Getting started](docs/GETTING_STARTED.md). It explains the experiment from
+> first principles and gives a safe, guided code tour.
 
-For squared-loss ridge, a literal self-teacher is degenerate. At the supervised
-optimum, `g_L = -lambda * theta`, while assigning each candidate the student's
-own prediction makes every candidate pseudo-gradient zero. The resulting score
-is the same non-positive constant for every candidate, so it supplies no
-ranking signal. The project retains this identity as a negative control rather
-than presenting self-teaching as the confirmatory method.
+## What we learned
 
-## Current evidence
+The locked v0 study covered eight ProteinGym assays and five random seeds. The
+table reports tracked means, rounded to five decimals. Spearman correlation and
+NDCG@10% are ranking metrics (higher is better); mean squared error (MSE)
+measures numerical prediction error (lower is better).
 
-The locked v0 result is negative for the proposed selector. Across eight assays
-and five seeds, full-Hessian influence selection was `-0.05526` Spearman below
-random pseudo-label selection, with 0/8 assay wins. Cross-fitted outer gradients
-and much smaller pseudo perturbations did not repair the ranking.
+| Method | Spearman | MSE | NDCG@10% |
+| --- | ---: | ---: | ---: |
+| Supervised only | 0.29309 | 1.73293 | 0.67166 |
+| Random pseudo-labels | 0.34971 | 1.18568 | 0.68573 |
+| Top teacher score | 0.34230 | 1.40425 | 0.63870 |
+| Full influence (ours) | 0.29445 | 1.56129 | 0.66225 |
+| No-Hessian influence | 0.33722 | 1.72346 | 0.68960 |
 
-The strongest diagnostic replaced the influence approximation entirely with
-exact four-fold validation-risk greedy selection. It still underperformed
-random by `0.43205` MSE and `0.04635` Spearman on the eight-assay exposed
-screen. Its validation loss improved sharply while hidden-test performance
-worsened, identifying adaptive validation overfitting / surrogate mismatch as
-a deeper failure than Hessian geometry alone. The preregistered gate failed,
-so 26 untouched assay outcomes remain sealed.
+- Random pseudo-labeling improved over supervised-only training. That is
+  consistent with useful signal in the calibrated teacher, but this comparison
+  also changes the loss-to-penalty balance (effective regularization), so it is
+  not a clean test of selection alone.
 
-Detailed, hash-bound decisions are tracked in:
+- Full influence versus random is the clean selection comparison: both use the
+  same teacher, pseudo-label count, weight, student, and test set. Full
+  influence was `-0.05526` mean Spearman below random, with 0/8 assay wins.
 
-- [`docs/results/overall-conclusion.md`](docs/results/overall-conclusion.md)
-- [`docs/results/v0-decision.md`](docs/results/v0-decision.md)
-- [`docs/results/crossfit-decision.md`](docs/results/crossfit-decision.md)
-- [`docs/results/locality-decision.md`](docs/results/locality-decision.md)
-- [`docs/results/exact-cv-decision.md`](docs/results/exact-cv-decision.md)
+- This is a setup-specific result for one teacher, representation, student,
+  label budget, and assay slice. It is not an impossibility theorem for
+  pseudo-label selection or protein fitness prediction.
 
-Compact public result tables are available in
-[`results/v0-method-means.csv`](results/v0-method-means.csv) and
-[`results/branch-effects.csv`](results/branch-effects.csv). The large raw
-datasets, embeddings, and task artifacts are deliberately excluded from Git.
+An exact cross-validation (exact-CV) diagnosis removed the influence
+approximation and selected candidates by their exact effect on reused
+validation folds. Validation loss fell sharply while hidden-test performance
+worsened, which is consistent with adaptive validation overfitting and/or a
+mismatch between the selection target and the final test goal. The 26
+designated untouched assay outcomes remained sealed. See the
+[overall scientific conclusion](docs/results/overall-conclusion.md) for the
+complete evidence chain and decision.
 
-These findings apply to the frozen ProteinGym/ESM1v/ESM-2-ridge setup. They do
-not establish that pseudo-label selection is impossible in other protein
-fitness regimes. The theory-to-experiment limitations are recorded in
-[`docs/research/theory-audit.md`](docs/research/theory-audit.md).
+## What claim does the study test?
 
-## Sources
+The literal same-student idea uses a student's own prediction as its
+pseudo-label. Under squared loss, prediction minus pseudo-label is then zero,
+so each candidate has zero residual and zero pseudo-gradient. Every candidate
+ties; the score has no ranking signal. This is an algebraic boundary, not a
+software defect.
 
-- [ProteinGym](https://proteingym.org/)
-- [Pinned ProteinGym v1.3 data record](https://zenodo.org/records/15293562)
-- [ESM-2 35M model card](https://huggingface.co/facebook/esm2_t12_35M_UR50D)
+The study therefore uses ProteinGym's external `ESM1v_ensemble` teacher. Its
+scores are calibrated on the 96 measured training variants and used as
+pseudo-labels for a separate ridge-regression student. V0 tests whether the
+proposed influence score can select helpful labels from that external teacher;
+it does not directly test literal self-teaching or prove the manuscript's
+theorem. The [theory-to-experiment audit](docs/research/theory-audit.md) gives
+the derivation and the remaining assumptions.
+
+## Your first hour
+
+1. Read [Getting started](docs/GETTING_STARTED.md), using its 10-minute science
+   route if you want the shortest conceptual introduction.
+2. Clone the repository and create the CPU environment in
+   [Development](#development).
+3. Inspect the locked protocol in [`configs/v0.yaml`](configs/v0.yaml).
+4. Run `uv run self-improve-protein --show-config` and
+   `uv run self-improve-protein --help` to see the validated configuration and
+   available pipeline stages.
+5. Run `uv run pytest`. These are code-path and traceability checks; they do
+   **not** rerun the scientific study.
+6. Read the [overall conclusion](docs/results/overall-conclusion.md) to see what
+   the evidence supports and what remains open.
+
+## Repository map
+
+| Path | What it contains |
+| --- | --- |
+| [`configs/v0.yaml`](configs/v0.yaml) | Locked protocol, data hashes, model revision, sample sizes, and seeds |
+| [`src/self_improve_protein/`](src/self_improve_protein/) | Data preparation, embeddings, student fitting, selection, evaluation, and diagnostic implementations |
+| [`tests/`](tests/) | Small-fixture, algebra, provenance, and command-line code-path checks |
+| [`slurm/`](slurm/) | Site-configured launchers for full CPU/GPU reproduction |
+| [`docs/research/`](docs/research/) | Experiment cards, protocol audit, theory audit, and verification ladder |
+| [`docs/results/`](docs/results/) | Reviewed decision memos and the overall scientific conclusion |
+| [`results/`](results/) | Compact, public CSV tables rather than large raw artifacts |
+
+The reviewed decisions are
+[v0](docs/results/v0-decision.md),
+[crossfit](docs/results/crossfit-decision.md),
+[locality](docs/results/locality-decision.md), and
+[exact-CV](docs/results/exact-cv-decision.md). The compact tables are
+[v0 method means](results/v0-method-means.csv) and
+[diagnostic branch effects](results/branch-effects.csv).
+
+## Pinned inputs
+
+- Substitution assays and zero-shot scores come from the
+  [ProteinGym v1.3 Zenodo record](https://zenodo.org/records/15293562).
+- Sequence representations use
+  [`facebook/esm2_t12_35M_UR50D`](https://huggingface.co/facebook/esm2_t12_35M_UR50D);
+  its exact revision is pinned in [`configs/v0.yaml`](configs/v0.yaml).
+- Pseudo-labels use the `ESM1v_ensemble` teacher distributed with the pinned
+  ProteinGym release.
 
 ## Development
 
-Python 3.11 or newer is required. Reproduce the executable development
-environment with `uv sync --frozen --extra dev --extra embed`, then run
-`uv run pytest`, `uv run ruff check .`, and `uv run mypy src`. The tracked
-lockfile pins NumPy 2.3.5 to freeze the `PCG64`/`Generator.choice` behavior used
-by the random selection baseline. As a local fallback, install with
-`pip install -e '.[dev,embed]'`. Importing the CLI and inspecting its bundled
-protocol do not require the embedding stack; install the `embed` extra before
-running `embed-assay`.
-
-For a first inspection:
+Python 3.11 or newer and [uv](https://docs.astral.sh/uv/) are required. The
+clone and first sync need network access. This fast orientation path is CPU-only
+and does not install the large Torch embedding stack:
 
 ```bash
-uv sync --frozen --extra dev --extra embed
+git clone https://github.com/pengzhangzhi/self_improve_protein.git
+cd self_improve_protein
+uv sync --frozen
 uv run self-improve-protein --show-config
 uv run self-improve-protein --help
 ```
 
-The main CLI exposes the pinned data preparation, ESM-2 embedding, task,
-aggregation, and exact-rebuild verification stages. `slurm/submit_pipeline.sh`
-submits the dependency-ordered cluster pipeline after its documented `SI_*`
-environment variables are set. The exploratory CLIs are available as Python
-modules, for example `python -m self_improve_protein.exact_cv_cli --help`.
+For the complete developer environment, including the optional embedding
+dependencies, run:
 
-The MIT license covers this repository's code. ProteinGym data and ESM model
-artifacts remain governed by their upstream terms and are not redistributed
-here.
+```bash
+uv sync --frozen --extra dev --extra embed
+uv run pytest
+uv run ruff check .
+uv run mypy src
+```
+
+The `embed` extra installs a large Torch/Transformers stack. The tests exercise
+the implementation with small fixtures and synthetic probes; passing them
+checks software behavior, not the study's scientific conclusion. Full data
+preparation, embedding, and Slurm reproduction require site-specific resources
+and maintainer coordination. Follow the guide's
+[maintainer-assisted Slurm section](docs/GETTING_STARTED.md#full-reproduction-with-slurm)
+rather than treating it as a local first-run command.
+
+The MIT license covers this repository's code. Public ProteinGym data and ESM
+model artifacts retain their upstream licenses and terms; large datasets,
+embeddings, model weights, logs, and task artifacts are not redistributed in
+this repository.
