@@ -551,6 +551,7 @@ def test_pool_slurm_stages_are_strict_and_use_exact_26_gpu_array() -> None:
     prepare_text = prepare.read_text(encoding="utf-8")
     assert "prepare-pool" in prepare_text
     assert "--gpus" not in prepare_text
+    assert "#SBATCH --time=04:00:00" in prepare_text
     assert "${SI_PROCESSED_ROOT:-" in prepare_text
     embed_text = embed.read_text(encoding="utf-8")
     assert "#SBATCH --array=0-25" in embed_text
