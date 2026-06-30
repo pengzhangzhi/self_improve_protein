@@ -543,15 +543,19 @@ def _cache_width(metadata_path: Path) -> int:
 
 def _git_commit(*, require_clean: bool = False) -> str:
     if require_clean:
-        for arguments in (
-            ("diff", "--quiet", "--"),
-            ("diff", "--cached", "--quiet", "--"),
-        ):
-            clean = subprocess.run(["git", *arguments], check=False)
-            if clean.returncode != 0:
-                raise ValueError(
-                    "official execution requires a clean tracked Git state"
-                )
+        clean = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if clean.returncode != 0 or clean.stdout:
+            raise ValueError("official execution requires a clean Git worktree")
     completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         check=False,

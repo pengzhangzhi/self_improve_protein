@@ -30,6 +30,42 @@ RUNNER = CliRunner()
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 
 
+def test_git_commit_clean_policy_rejects_untracked_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(tuple(command))
+        if command[1] == "status":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="?? src/self_improve_protein/new_method.py\n",
+                stderr="",
+            )
+        if command[1] == "rev-parse":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="a" * 40 + "\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="clean Git worktree"):
+        cli_module._git_commit(require_clean=True)
+
+    assert (
+        "git",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ) in commands
+
+
 def _sequence(index: int) -> str:
     return "A" + AMINO_ACIDS[(index // 20) % 20] + AMINO_ACIDS[index % 20]
 
