@@ -95,7 +95,7 @@ Run from the repository root so that `SI_REPO_ROOT` resolves correctly.
 export SI_ACCOUNT="your-cluster-account"
 export SI_CPU_PARTITION="your-cpu-partition"
 export SI_GPU_PARTITION="your-gpu-partition"
-export SI_REPO_ROOT="$(pwd)"
+export SI_REPO_ROOT="$(pwd -P)"
 export SI_DATA_ROOT="/path/to/project-data"
 export SI_ARTIFACT_ROOT="/path/to/project-artifacts"
 export SI_SLURM_CONF="/path/to/slurm.conf"
